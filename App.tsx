@@ -1,13 +1,13 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { createBottomTabNavigator, useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import { createNavigationContainerRef, NavigationContainer } from '@react-navigation/native';
-import * as Notifications from 'expo-notifications';
 import { StatusBar } from 'expo-status-bar';
 import { ReactNode, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -16,15 +16,6 @@ import {
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import Svg, { Circle, Path } from 'react-native-svg';
-
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldPlaySound: true,
-    shouldSetBadge: false,
-    shouldShowBanner: true,
-    shouldShowList: true,
-  }),
-});
 
 declare const process: {
   env: {
@@ -43,6 +34,7 @@ type WarnNotice = {
   date: string;
   employees: number;
   reason: string;
+  ticker?: string;
 };
 
 type CachePayload = {
@@ -50,13 +42,11 @@ type CachePayload = {
   notices: WarnNotice[];
 };
 
-type AlertTopicKey = 'weeklyCompanies' | 'monthlyCompanies' | 'weeklyRegions' | 'monthlyIndustries' | 'weeklyDigest';
 type RootTabParamList = {
   Overview: undefined;
   Companies: undefined;
   Regions: undefined;
   Notices: undefined;
-  Alerts: undefined;
 };
 
 type RankedRow = {
@@ -64,27 +54,27 @@ type RankedRow = {
   value: number;
   notices: number;
   meta?: string;
+  ticker?: string;
 };
 type CompanyRangeKey = '7d' | '30d' | 'all';
-type NoticeRangeKey = 'recent' | '30d' | 'all';
+type NoticeRangeKey = '7d' | '30d' | 'all';
 type StockQuote = {
   currency: string;
   marketState: string;
   price: number;
   regularMarketChangePercent?: number;
+  regularMarketTime?: number;
   symbol: string;
 };
 
-const WARN_API_KEY = process.env.EXPO_PUBLIC_WARN_FIREHOSE_API_KEY ?? '';
-const WARN_ENDPOINT = 'https://warnfirehose.com/api/records?limit=5000';
+const WARN_API_KEY = process.env.EXPO_PUBLIC_WARN_FIREHOSE_API_KEY;
+const WARN_BASE_ENDPOINT = 'https://warnfirehose.com/api/records';
+const PAGE_LIMIT = 25;
+const MAX_API_CALLS = 20;
 const CACHE_KEY = 'warnfirehose.warn_notices.v1';
-const ALERT_SETTINGS_KEY = 'warnfirehose.alert_settings.v1';
-const ALERT_NOTIFICATION_IDS_KEY = 'warnfirehose.alert_notification_ids.v1';
-const ALERT_ONBOARDING_KEY = 'warnfirehose.alert_onboarding_sent.v1';
-const ALERT_PERMISSION_PROMPTED_KEY = 'warnfirehose.alert_permission_prompted.v1';
-const DAILY_API_CALL_TARGET = 10;
-const CACHE_REFRESH_INTERVAL_MS = (24 * 60 * 60 * 1000) / DAILY_API_CALL_TARGET;
-const CACHE_REFRESH_CHECK_MS = 60 * 1000;
+const CACHE_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CACHE_REFRESH_CHECK_MS = 60 * 1000; // Check every minute
+const CACHE_REFRESH_HOUR = 7; // 7 AM
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 const palette = {
@@ -101,14 +91,6 @@ const palette = {
   green: '#12805c',
 };
 
-const alertTopics: { key: AlertTopicKey; label: string; description: string }[] = [
-  { key: 'weeklyCompanies', label: 'Top company weekly', description: 'Largest WARN company movement over the last 7 days.' },
-  { key: 'monthlyCompanies', label: 'Top company monthly', description: 'Largest WARN company movement over the last 30 days.' },
-  { key: 'weeklyRegions', label: 'Top region weekly', description: 'State-level WARN concentration from the recent feed.' },
-  { key: 'monthlyIndustries', label: 'Top industry monthly', description: 'Sector stress from WARN notices in the latest month.' },
-  { key: 'weeklyDigest', label: 'Weekly digest', description: 'A compact summary of notices, workers, companies, and states.' },
-];
-
 const Tab = createBottomTabNavigator<RootTabParamList>();
 const navigationRef = createNavigationContainerRef<RootTabParamList>();
 
@@ -119,7 +101,7 @@ const companyRanges: { key: CompanyRangeKey; label: string }[] = [
 ];
 
 const noticeRanges: { key: NoticeRangeKey; label: string }[] = [
-  { key: 'recent', label: 'Recent' },
+  { key: '7d', label: '7D' },
   { key: '30d', label: '30D' },
   { key: 'all', label: 'All' },
 ];
@@ -304,27 +286,57 @@ export default function App() {
       throw new Error('Missing EXPO_PUBLIC_WARN_FIREHOSE_API_KEY in .env');
     }
 
-    const response = await fetch(WARN_ENDPOINT, {
+    let allRecords: WarnNotice[] = [];
+    let offset = 0;
+    let total = 0;
+    let apiCallCount = 0;
+
+    // Fetch first page to get total count
+    const firstResponse = await fetch(`${WARN_BASE_ENDPOINT}?limit=${PAGE_LIMIT}&offset=${offset}`, {
       headers: {
         'X-API-Key': WARN_API_KEY,
         Accept: 'application/json',
       },
     });
+    apiCallCount++;
 
-    if (!response.ok) {
-      throw new Error(`WARN Firehose returned ${response.status}`);
+    if (!firstResponse.ok) {
+      throw new Error(`WARN Firehose returned ${firstResponse.status}`);
     }
 
-    const json = await response.json();
-    const records = extractRecords(json).map(normalizeNotice).filter(Boolean) as WarnNotice[];
+    const firstJson = await firstResponse.json();
+    total = firstJson.total || 0;
+    const firstRecords = extractRecords(firstJson).map(normalizeNotice).filter(Boolean) as WarnNotice[];
+    allRecords = [...firstRecords];
 
-    if (!records.length) {
+    // Fetch remaining pages, but limit to MAX_API_CALLS total
+    offset += PAGE_LIMIT;
+    while (offset < total && apiCallCount < MAX_API_CALLS) {
+      const response = await fetch(`${WARN_BASE_ENDPOINT}?limit=${PAGE_LIMIT}&offset=${offset}`, {
+        headers: {
+          'X-API-Key': WARN_API_KEY,
+          Accept: 'application/json',
+        },
+      });
+      apiCallCount++;
+
+      if (!response.ok) {
+        throw new Error(`WARN Firehose returned ${response.status} at offset ${offset}`);
+      }
+
+      const json = await response.json();
+      const records = extractRecords(json).map(normalizeNotice).filter(Boolean) as WarnNotice[];
+      allRecords = [...allRecords, ...records];
+      offset += PAGE_LIMIT;
+    }
+
+    if (!allRecords.length) {
       throw new Error('No WARN notices were returned by the API');
     }
 
     const savedAt = new Date().toISOString();
-    await AsyncStorage.setItem(CACHE_KEY, JSON.stringify({ savedAt, notices: records }));
-    setNotices(records);
+    await AsyncStorage.setItem(CACHE_KEY, JSON.stringify({ savedAt, notices: allRecords }));
+    setNotices(allRecords);
     setLastUpdatedAt(savedAt);
   }
 
@@ -340,26 +352,9 @@ export default function App() {
     await fetchAndCache();
   }
 
-  async function bootstrapNotificationPermission() {
-    const [permissions, prompted] = await Promise.all([
-      Notifications.getPermissionsAsync(),
-      AsyncStorage.getItem(ALERT_PERMISSION_PROMPTED_KEY),
-    ]);
-
-    if (!prompted && permissions.status === 'undetermined') {
-      openAlertsTab();
-      const requested = await Notifications.requestPermissionsAsync();
-      await AsyncStorage.setItem(ALERT_PERMISSION_PROMPTED_KEY, new Date().toISOString());
-      if (requested.granted) {
-        await sendNotificationOnboardingConfirmation();
-      }
-      return;
-    }
-  }
-
   return (
     <SafeAreaProvider>
-      <NavigationContainer ref={navigationRef} onReady={() => bootstrapNotificationPermission()}>
+      <NavigationContainer ref={navigationRef}>
         <StatusBar style="dark" />
         <AppTabs
           analytics={analytics}
@@ -414,58 +409,41 @@ function AppTabs({
       })}
     >
       <Tab.Screen name="Overview">
-        {() => (
-          <ScreenShell loading={loading} error={error}>
-            <OverviewScreen
-              analytics={analytics}
-              lastUpdatedAt={lastUpdatedAt}
-              totalCount={totalCount}
-            />
-          </ScreenShell>
-        )}
+        {() => <OverviewScreenWrapper analytics={analytics} error={error} lastUpdatedAt={lastUpdatedAt} loading={loading} notices={notices} totalCount={totalCount} />}
       </Tab.Screen>
       <Tab.Screen name="Companies">
-        {() => (
-          <ScreenShell loading={loading} error={error}>
-            <CompaniesScreen analytics={analytics} />
-          </ScreenShell>
-        )}
+        {() => <CompaniesScreenWrapper analytics={analytics} error={error} loading={loading} />}
       </Tab.Screen>
       <Tab.Screen name="Regions">
-        {() => (
-          <ScreenShell loading={loading} error={error}>
-            <RegionsScreen analytics={analytics} />
-          </ScreenShell>
-        )}
+        {() => <RegionsScreenWrapper analytics={analytics} error={error} loading={loading} />}
       </Tab.Screen>
       <Tab.Screen name="Notices">
-        {() => (
-          <ScreenShell loading={loading} error={error}>
-            <NoticesScreen notices={notices} />
-          </ScreenShell>
-        )}
-      </Tab.Screen>
-      <Tab.Screen name="Alerts">
-        {() => (
-          <ScreenShell loading={loading} error={error}>
-            <AlertsScreen analytics={analytics} />
-          </ScreenShell>
-        )}
+        {() => <NoticesScreenWrapper error={error} loading={loading} notices={notices} />}
       </Tab.Screen>
     </Tab.Navigator>
   );
 }
 
-function ScreenShell({ children, error, loading }: { children: ReactNode; error: string | null; loading: boolean }) {
+function ScreenShell({ children, error, loading, onRefresh, refreshing, searchValue, onSearchChange, searchPlaceholder }: { children: ReactNode; error: string | null; loading: boolean; onRefresh?: () => void; refreshing?: boolean; searchValue?: string; onSearchChange?: (value: string) => void; searchPlaceholder?: string }) {
   const tabBarHeight = useBottomTabBarHeight();
 
   return (
     <SafeAreaView edges={['top']} style={styles.safeArea}>
       <ScrollView
         contentContainerStyle={[styles.content, { paddingBottom: tabBarHeight + 18 }]}
+        refreshControl={
+          onRefresh ? (
+            <RefreshControl
+              refreshing={refreshing || false}
+              onRefresh={onRefresh}
+              tintColor={palette.red}
+              colors={[palette.red]}
+            />
+          ) : undefined
+        }
         showsVerticalScrollIndicator={false}
       >
-        <Header />
+        <Header searchValue={searchValue} onSearchChange={onSearchChange} searchPlaceholder={searchPlaceholder} />
         {loading ? (
           <View style={styles.loadingPanel}>
             <ActivityIndicator color={palette.red} />
@@ -487,43 +465,27 @@ function ScreenShell({ children, error, loading }: { children: ReactNode; error:
   );
 }
 
-function Header() {
+function Header({ searchValue, onSearchChange, searchPlaceholder }: { searchValue?: string; onSearchChange?: (value: string) => void; searchPlaceholder?: string }) {
   return (
     <View style={styles.header}>
       <View style={styles.logoRow}>
         <View style={styles.logoMark}>
-          <Text style={styles.logoText}>B</Text>
+          <Text style={styles.logoText}>b{'\n'}WARN{'\n'}ed</Text>
         </View>
-        <View style={styles.headerCopy}>
-          <Text style={styles.title}>WARN layoff intelligence</Text>
-        </View>
+        {onSearchChange && (
+          <TextInput
+            autoCapitalize="none"
+            clearButtonMode="while-editing"
+            onChangeText={onSearchChange}
+            placeholder={searchPlaceholder || "Search"}
+            placeholderTextColor={palette.muted}
+            style={styles.headerSearchInput}
+            value={searchValue}
+          />
+        )}
       </View>
     </View>
   );
-}
-
-function openAlertsTab() {
-  setTimeout(() => {
-    if (navigationRef.isReady()) {
-      navigationRef.navigate('Alerts');
-    }
-  }, 250);
-}
-
-async function sendNotificationOnboardingConfirmation() {
-  const sent = await AsyncStorage.getItem(ALERT_ONBOARDING_KEY);
-  if (sent) {
-    return;
-  }
-
-  await Notifications.scheduleNotificationAsync({
-    content: {
-      title: 'WARN alerts enabled',
-      body: 'Choose the weekly layoff signals you want to receive next.',
-    },
-    trigger: null,
-  });
-  await AsyncStorage.setItem(ALERT_ONBOARDING_KEY, new Date().toISOString());
 }
 
 function TabGlyph({ color, focused, name }: { color: string; focused: boolean; name: keyof RootTabParamList }) {
@@ -569,97 +531,243 @@ function tabIcon(name: keyof RootTabParamList, color: string) {
           <Path d="M14 4v4h4M10 12h5M10 16h5" stroke={color} strokeLinecap="round" strokeWidth={2.1} />
         </>
       );
-    case 'Alerts':
-      return (
-        <>
-          <Path d="M18 10a6 6 0 0 0-12 0c0 6-2 6-2 8h16c0-2-2-2-2-8Z" fill="none" stroke={color} strokeLinejoin="round" strokeWidth={2.1} />
-          <Path d="M10 21h4" stroke={color} strokeLinecap="round" strokeWidth={2.1} />
-        </>
-      );
   }
 }
 
-function OverviewScreen({ analytics, lastUpdatedAt, totalCount }: { analytics: Analytics; lastUpdatedAt: string | null; totalCount: number }) {
+function OverviewScreenWrapper({ analytics, error, lastUpdatedAt, loading, notices, totalCount }: { analytics: Analytics; error: string | null; lastUpdatedAt: string | null; loading: boolean; notices: WarnNotice[]; totalCount: number }) {
   const [companyQuery, setCompanyQuery] = useState('');
-  const topCompanies = filterRankedRows(analytics.topCompanies30, companyQuery).slice(0, 8);
-  const allCompanies = filterRankedRows(analytics.topCompaniesAll, companyQuery).slice(0, 20);
+  const [refreshing, setRefreshing] = useState(false);
+  const [logoRefreshKey, setLogoRefreshKey] = useState(0);
+  const [localAnalytics, setLocalAnalytics] = useState(analytics);
+
+  async function handleRefresh() {
+    setRefreshing(true);
+    // Recalculate analytics from current notices
+    setLocalAnalytics(buildAnalytics(notices));
+    // Increment logo refresh key to force logo re-fetching
+    setLogoRefreshKey((current) => current + 1);
+    // Simulate a brief refresh action
+    await new Promise(resolve => setTimeout(resolve, 500));
+    setRefreshing(false);
+  }
+
+  // Update local analytics when parent analytics changes
+  useEffect(() => {
+    setLocalAnalytics(analytics);
+  }, [analytics]);
+
+  return (
+    <ScreenShell loading={loading} error={error} onRefresh={handleRefresh} refreshing={refreshing} searchValue={companyQuery} onSearchChange={setCompanyQuery} searchPlaceholder="Search companies">
+      <OverviewScreen
+        analytics={localAnalytics}
+        companyQuery={companyQuery}
+        lastUpdatedAt={lastUpdatedAt}
+        logoRefreshKey={logoRefreshKey}
+        notices={notices}
+        totalCount={totalCount}
+      />
+    </ScreenShell>
+  );
+}
+
+function OverviewScreen({ analytics, companyQuery, lastUpdatedAt, logoRefreshKey, notices, totalCount }: { analytics: Analytics; companyQuery: string; lastUpdatedAt: string | null; logoRefreshKey: number; notices: WarnNotice[]; totalCount: number }) {
+  const [range, setRange] = useState<CompanyRangeKey>('30d');
+  const isSearching = companyQuery.trim().length > 0;
+
+  // When searching, group and rank all notices that match the query
+  const topCompanies = isSearching
+    ? (() => {
+        const companies = groupBy(notices, (notice) => notice.company || 'Unknown company');
+        const allRanked = rankGroups(companies);
+        return filterRankedRows(allRanked, companyQuery).slice(0, 5);
+      })()
+    : getCompanyRowsForRange(analytics, range).slice(0, 5);
+
+  const topRegions = getRegionRowsForRange(analytics, range).slice(0, 5);
+  const topIndustries = getIndustryRowsForRange(analytics, range).slice(0, 5);
+
+  // Check if searched company is in top 5
+  const hasSearchedCompanyInTop5 = isSearching && topCompanies.length > 0;
+  const momentumTitle = isSearching && !hasSearchedCompanyInTop5 ? "All Companies" : getMomentumTitle(range);
+  const regionsTitle = getRegionsTitle(range);
+  const industriesTitle = getIndustriesTitle(range);
 
   return (
     <View style={styles.screen}>
-      <View style={styles.metaRow}>
-        <MetaPill label="Last updated" value={lastUpdatedAt ? formatUpdateTime(lastUpdatedAt) : 'Pending'} />
-        <MetaPill label="Cached" value={`${totalCount.toLocaleString()} notices`} />
-      </View>
+      {!isSearching && (
+        <SegmentedControl options={companyRanges} selected={range} onSelect={setRange} />
+      )}
 
-      <SearchBox value={companyQuery} onChangeText={setCompanyQuery} placeholder="Search companies" />
-
-      <Section eyebrow="Momentum" title="Top companies, last 30 days">
-        <RankList rows={topCompanies} emptyLabel="No matching companies in the last 30 days." showStock />
+      <Section eyebrow="Momentum" title={momentumTitle}>
+        <RankList rows={topCompanies} emptyLabel={isSearching ? "No matching companies found." : `No matching companies in the selected period.`} logoRefreshKey={logoRefreshKey} showStock />
       </Section>
 
-      <Section eyebrow="Company directory" title="All companies">
-        <RankList rows={allCompanies} emptyLabel="No matching company telemetry available." showStock />
-      </Section>
+      {!isSearching && (
+        <>
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.horizontalSectionsContainer}
+          >
+            <View style={styles.horizontalSection}>
+              <Text style={styles.horizontalSectionEyebrow}>Geography</Text>
+              <Text style={styles.horizontalSectionTitle}>{regionsTitle}</Text>
+              <View style={styles.horizontalSectionBody}>
+                <BarList rows={topRegions} />
+              </View>
+            </View>
+
+            <View style={styles.horizontalSection}>
+              <Text style={styles.horizontalSectionEyebrow}>Sectors</Text>
+              <Text style={styles.horizontalSectionTitle}>{industriesTitle}</Text>
+              <View style={styles.horizontalSectionBody}>
+                <BarList rows={topIndustries} />
+              </View>
+            </View>
+          </ScrollView>
+
+          <View style={styles.metaRow}>
+            <MetaPill label="Last updated" value={lastUpdatedAt ? formatUpdateTime(lastUpdatedAt) : 'Pending'} />
+          </View>
+        </>
+      )}
     </View>
   );
 }
 
-function CompaniesScreen({ analytics }: { analytics: Analytics }) {
-  const [range, setRange] = useState<CompanyRangeKey>('30d');
+function CompaniesScreenWrapper({ analytics, error, loading }: { analytics: Analytics; error: string | null; loading: boolean }) {
   const [companyQuery, setCompanyQuery] = useState('');
-  const rows = filterRankedRows(getCompanyRowsForRange(analytics, range), companyQuery).slice(0, 25);
+  const [refreshing, setRefreshing] = useState(false);
+  const [logoRefreshKey, setLogoRefreshKey] = useState(0);
+  const [localAnalytics, setLocalAnalytics] = useState(analytics);
+
+  async function handleRefresh() {
+    setRefreshing(true);
+    // Recalculate analytics - force re-render
+    setLocalAnalytics({ ...analytics });
+    // Increment logo refresh key to force logo re-fetching
+    setLogoRefreshKey((current) => current + 1);
+    // Simulate a brief refresh action
+    await new Promise(resolve => setTimeout(resolve, 500));
+    setRefreshing(false);
+  }
+
+  // Update local analytics when parent analytics changes
+  useEffect(() => {
+    setLocalAnalytics(analytics);
+  }, [analytics]);
+
+  return (
+    <ScreenShell loading={loading} error={error} onRefresh={handleRefresh} refreshing={refreshing} searchValue={companyQuery} onSearchChange={setCompanyQuery} searchPlaceholder="Search companies">
+      <CompaniesScreen analytics={localAnalytics} companyQuery={companyQuery} logoRefreshKey={logoRefreshKey} />
+    </ScreenShell>
+  );
+}
+
+function CompaniesScreen({ analytics, companyQuery, logoRefreshKey }: { analytics: Analytics; companyQuery: string; logoRefreshKey: number }) {
+  const [range, setRange] = useState<CompanyRangeKey>('all');
+  const rows = filterRankedRows(getCompanyRowsForRange(analytics, range), companyQuery);
 
   return (
     <View style={styles.screen}>
-      <SearchBox value={companyQuery} onChangeText={setCompanyQuery} placeholder="Search companies" />
       <SegmentedControl options={companyRanges} selected={range} onSelect={setRange} />
 
       <Section eyebrow="Companies" title={companyRangeTitle(range)}>
-        <RankList rows={rows} emptyLabel="No matching company telemetry available." />
+        <RankList rows={rows} emptyLabel="No matching company telemetry available." logoRefreshKey={logoRefreshKey} showStock />
       </Section>
     </View>
   );
 }
 
-function RegionsScreen({ analytics }: { analytics: Analytics }) {
+function RegionsScreenWrapper({ analytics, error, loading }: { analytics: Analytics; error: string | null; loading: boolean }) {
   const [regionQuery, setRegionQuery] = useState('');
-  const stateRows = filterRankedRows(analytics.topStates, regionQuery);
-  const industryRows = filterRankedRows(analytics.topIndustries, regionQuery);
+  const [refreshing, setRefreshing] = useState(false);
+  const [localAnalytics, setLocalAnalytics] = useState(analytics);
+
+  async function handleRefresh() {
+    setRefreshing(true);
+    // Recalculate analytics - force re-render
+    setLocalAnalytics({ ...analytics });
+    // Simulate a brief refresh action
+    await new Promise(resolve => setTimeout(resolve, 500));
+    setRefreshing(false);
+  }
+
+  // Update local analytics when parent analytics changes
+  useEffect(() => {
+    setLocalAnalytics(analytics);
+  }, [analytics]);
+
+  return (
+    <ScreenShell loading={loading} error={error} onRefresh={handleRefresh} refreshing={refreshing} searchValue={regionQuery} onSearchChange={setRegionQuery} searchPlaceholder="Search states or industries">
+      <RegionsScreen analytics={localAnalytics} regionQuery={regionQuery} />
+    </ScreenShell>
+  );
+}
+
+function RegionsScreen({ analytics, regionQuery }: { analytics: Analytics; regionQuery: string }) {
+  const [range, setRange] = useState<CompanyRangeKey>('30d');
+  const stateRows = filterRankedRows(getRegionRowsForRange(analytics, range), regionQuery);
+  const industryRows = filterRankedRows(getIndustryRowsForRange(analytics, range), regionQuery);
+
+  const stateTitle = range === '7d' ? 'State exposure, last 7 days' : range === '30d' ? 'State exposure, last 30 days' : 'State exposure, all time';
+  const industryTitle = range === '7d' ? 'Industry stress, last 7 days' : range === '30d' ? 'Industry stress, last 30 days' : 'Industry stress, all time';
 
   return (
     <View style={styles.screen}>
-      <SearchBox value={regionQuery} onChangeText={setRegionQuery} placeholder="Search states or industries" />
+      <SegmentedControl options={companyRanges} selected={range} onSelect={setRange} />
 
-      <View style={styles.metricGrid}>
-        <MetricCard label="States" value={analytics.stateCount.toLocaleString()} detail="with WARN filings" accent={palette.red} />
-        <MetricCard label="Industries" value={analytics.industryCount.toLocaleString()} detail="represented" accent={palette.ink} />
-      </View>
-
-      <Section eyebrow="Geography" title="State exposure">
+      <Section eyebrow="Geography" title={stateTitle}>
         <BarList rows={stateRows} />
       </Section>
 
-      <Section eyebrow="Sectors" title="Industry stress">
+      <Section eyebrow="Sectors" title={industryTitle}>
         <BarList rows={industryRows} />
       </Section>
     </View>
   );
 }
 
-function NoticesScreen({ notices }: { notices: WarnNotice[] }) {
-  const [range, setRange] = useState<NoticeRangeKey>('recent');
+function NoticesScreenWrapper({ error, loading, notices }: { error: string | null; loading: boolean; notices: WarnNotice[] }) {
   const [noticeQuery, setNoticeQuery] = useState('');
-  const visibleNotices = filterNotices(getNoticesForRange(notices, range), noticeQuery).slice(0, 50);
+  const [refreshing, setRefreshing] = useState(false);
+  const [logoRefreshKey, setLogoRefreshKey] = useState(0);
+
+  async function handleRefresh() {
+    setRefreshing(true);
+    // Increment logo refresh key to force logo re-fetching
+    setLogoRefreshKey((current) => current + 1);
+    // Simulate a brief refresh action
+    await new Promise(resolve => setTimeout(resolve, 500));
+    setRefreshing(false);
+  }
+
+  return (
+    <ScreenShell loading={loading} error={error} onRefresh={handleRefresh} refreshing={refreshing} searchValue={noticeQuery} onSearchChange={setNoticeQuery} searchPlaceholder="Search notices">
+      <NoticesScreen logoRefreshKey={logoRefreshKey} notices={notices} noticeQuery={noticeQuery} />
+    </ScreenShell>
+  );
+}
+
+function NoticesScreen({ logoRefreshKey, notices, noticeQuery }: { logoRefreshKey: number; notices: WarnNotice[]; noticeQuery: string }) {
+  const [range, setRange] = useState<NoticeRangeKey>('7d');
+  const [expandedNotice, setExpandedNotice] = useState<string | null>(null);
+  const visibleNotices = filterNotices(getNoticesForRange(notices, range), noticeQuery);
 
   return (
     <View style={styles.screen}>
-      <SearchBox value={noticeQuery} onChangeText={setNoticeQuery} placeholder="Search notices" />
       <SegmentedControl options={noticeRanges} selected={range} onSelect={setRange} />
 
       <Section eyebrow="Company tape" title={noticeRangeTitle(range)}>
         {visibleNotices.length ? (
           visibleNotices.map((notice) => (
-            <NoticeRow key={notice.id} notice={notice} />
+            <NoticeRow
+              key={notice.id}
+              logoRefreshKey={logoRefreshKey}
+              notice={notice}
+              isExpanded={expandedNotice === notice.id}
+              onToggle={() => setExpandedNotice(expandedNotice === notice.id ? null : notice.id)}
+            />
           ))
         ) : (
           <Text style={styles.emptyText}>No matching WARN notices.</Text>
@@ -669,143 +777,21 @@ function NoticesScreen({ notices }: { notices: WarnNotice[] }) {
   );
 }
 
-function AlertsScreen({ analytics }: { analytics: Analytics }) {
-  const [permission, setPermission] = useState('unknown');
-  const [alertQuery, setAlertQuery] = useState('');
-  const [selectedTopics, setSelectedTopics] = useState<AlertTopicKey[]>([]);
-  const [statusMessage, setStatusMessage] = useState('Choose the weekly alerts you want to receive.');
-  const enabled = permission === 'granted' && selectedTopics.length > 0;
-  const visibleTopics = alertTopics.filter((topic) => `${topic.label} ${topic.description}`.toLowerCase().includes(alertQuery.trim().toLowerCase()));
-
-  useEffect(() => {
-    loadAlertPreferences();
-  }, []);
-
-  async function loadAlertPreferences() {
-    const [settings, permissions] = await Promise.all([
-      AsyncStorage.getItem(ALERT_SETTINGS_KEY),
-      Notifications.getPermissionsAsync(),
-    ]);
-    setPermission(permissions.status);
-
-    if (settings) {
-      const parsed = JSON.parse(settings) as { topics?: AlertTopicKey[] };
-      setSelectedTopics(parsed.topics ?? []);
-    }
-  }
-
-  async function requestPermission() {
-    const permissions = await Notifications.requestPermissionsAsync();
-    setPermission(permissions.status);
-    if (permissions.granted) {
-      await sendNotificationOnboardingConfirmation();
-    }
-    setStatusMessage(
-      permissions.granted ? 'Notifications are allowed. Pick one or more weekly alerts.' : 'Notifications are not enabled for this device.'
-    );
-    return permissions.granted;
-  }
-
-  async function toggleTopic(topic: AlertTopicKey) {
-    if (permission !== 'granted') {
-      const granted = await requestPermission();
-      if (!granted) {
-        return;
-      }
-    }
-
-    setSelectedTopics((current) =>
-      current.includes(topic) ? current.filter((item) => item !== topic) : [...current, topic]
-    );
-  }
-
-  async function saveAlerts() {
-    if (permission !== 'granted') {
-      const granted = await requestPermission();
-      if (!granted) {
-        return;
-      }
-    }
-
-    if (!selectedTopics.length) {
-      await turnOffAlerts();
-      return;
-    }
-
-    const ids = await scheduleWeeklyAlerts(selectedTopics, analytics);
-    await AsyncStorage.setItem(ALERT_SETTINGS_KEY, JSON.stringify({ topics: selectedTopics, updatedAt: new Date().toISOString() }));
-    await AsyncStorage.setItem(ALERT_NOTIFICATION_IDS_KEY, JSON.stringify(ids));
-    await sendImmediateAlertPreview(selectedTopics, analytics);
-    setStatusMessage('Weekly local notifications are scheduled for Monday at 9:00 AM. A confirmation was sent now.');
-  }
-
-  async function turnOffAlerts() {
-    await clearScheduledAlertNotifications();
-    await AsyncStorage.removeItem(ALERT_SETTINGS_KEY);
-    setSelectedTopics([]);
-    setStatusMessage('Weekly local notifications are turned off.');
-  }
-
-  return (
-    <View style={styles.screen}>
-      <SearchBox value={alertQuery} onChangeText={setAlertQuery} placeholder="Search alerts" />
-
-      <Section eyebrow="Notifications" title="Weekly alert settings">
-        <Text style={styles.alertIntro}>
-          If notifications are allowed, choose the weekly layoff signals you want next. You can select multiple topics.
-        </Text>
-
-        <Pressable accessibilityRole="button" onPress={requestPermission} style={styles.primaryButton}>
-          <Text style={styles.primaryButtonText}>{permission === 'granted' ? 'Notifications allowed' : 'Allow notifications'}</Text>
-        </Pressable>
-
-        <View style={styles.topicList}>
-          {visibleTopics.map((topic) => {
-            const selected = selectedTopics.includes(topic.key);
-            return (
-              <Pressable
-                accessibilityRole="checkbox"
-                accessibilityState={{ checked: selected }}
-                key={topic.key}
-                onPress={() => toggleTopic(topic.key)}
-                style={[styles.topicRow, selected && styles.topicRowSelected]}
-              >
-                <View style={[styles.checkbox, selected && styles.checkboxSelected]}>
-                  <Text style={[styles.checkboxText, selected && styles.checkboxTextSelected]}>{selected ? 'on' : ''}</Text>
-                </View>
-                <View style={styles.topicCopy}>
-                  <Text style={styles.topicLabel}>{topic.label}</Text>
-                  <Text style={styles.topicDescription}>{topic.description}</Text>
-                </View>
-              </Pressable>
-            );
-          })}
-        </View>
-
-        <View style={styles.alertActions}>
-          <Pressable accessibilityRole="button" onPress={saveAlerts} style={styles.primaryButton}>
-            <Text style={styles.primaryButtonText}>{enabled ? 'Update weekly alerts' : 'Schedule selected alerts'}</Text>
-          </Pressable>
-          <Pressable accessibilityRole="button" onPress={turnOffAlerts} style={styles.secondaryButton}>
-            <Text style={styles.secondaryButtonText}>Turn off alerts</Text>
-          </Pressable>
-        </View>
-
-        <Text style={styles.statusText}>{statusMessage}</Text>
-      </Section>
-    </View>
-  );
-}
-
-function CompanyLogo({ company }: { company: string }) {
+function CompanyLogo({ company, refreshKey }: { company: string; refreshKey?: number }) {
   const [sourceIndex, setSourceIndex] = useState(0);
   const logoSources = getLogoSources(company);
   const logoUrl = logoSources[sourceIndex];
+
+  // Reset source index when refreshKey changes
+  useEffect(() => {
+    setSourceIndex(0);
+  }, [refreshKey]);
 
   return (
     <View style={styles.companyLogo}>
       {logoUrl ? (
         <Image
+          key={`${company}-${refreshKey}`}
           resizeMode="contain"
           source={{ uri: logoUrl }}
           onError={() => setSourceIndex((current) => current + 1)}
@@ -826,20 +812,6 @@ function MetaPill({ label, value }: { label: string; value: string }) {
         {value}
       </Text>
     </View>
-  );
-}
-
-function SearchBox({ onChangeText, placeholder, value }: { onChangeText: (value: string) => void; placeholder: string; value: string }) {
-  return (
-    <TextInput
-      autoCapitalize="none"
-      clearButtonMode="while-editing"
-      onChangeText={onChangeText}
-      placeholder={placeholder}
-      placeholderTextColor={palette.muted}
-      style={styles.searchInput}
-      value={value}
-    />
   );
 }
 
@@ -889,7 +861,9 @@ function MetricCard({ accent, detail, label, value }: { accent: string; detail: 
   );
 }
 
-function RankList({ emptyLabel, rows, showStock = false }: { emptyLabel: string; rows: RankedRow[]; showStock?: boolean }) {
+function RankList({ emptyLabel, logoRefreshKey, rows, showStock = false }: { emptyLabel: string; logoRefreshKey?: number; rows: RankedRow[]; showStock?: boolean }) {
+  const [expandedCompany, setExpandedCompany] = useState<string | null>(null);
+
   if (!rows.length) {
     return <Text style={styles.emptyText}>{emptyLabel}</Text>;
   }
@@ -897,52 +871,33 @@ function RankList({ emptyLabel, rows, showStock = false }: { emptyLabel: string;
   return (
     <View style={styles.rankList}>
       {rows.map((row, index) => (
-        <CompanyRow key={`${row.label}-${index}`} index={index} row={row} showStock={showStock} />
+        <CompanyRow
+          key={`${row.label}-${index}`}
+          index={index}
+          logoRefreshKey={logoRefreshKey}
+          row={row}
+          showStock={showStock}
+          isExpanded={expandedCompany === row.label}
+          onToggle={() => setExpandedCompany(expandedCompany === row.label ? null : row.label)}
+        />
       ))}
     </View>
   );
 }
 
-function CompanyRow({ index, row, showStock = false }: { index: number; row: RankedRow; showStock?: boolean }) {
-  return (
-    <View style={styles.companyRow}>
-      <View style={styles.logoStack}>
-        <CompanyLogo company={row.label} />
-        <View style={styles.rankBadge}>
-          <Text style={styles.rankBadgeText}>{index + 1}</Text>
-        </View>
-      </View>
-      <View style={styles.companyMain}>
-        <Text style={styles.companyName} numberOfLines={1}>
-          {row.label}
-        </Text>
-        <Text style={styles.companyMeta} numberOfLines={1}>
-          {row.notices.toLocaleString()} notices{row.meta ? ` / ${row.meta}` : ''}
-        </Text>
-      </View>
-      <View style={styles.companyImpact}>
-        <Text style={styles.companyWorkers}>{row.value.toLocaleString()}</Text>
-        <Text style={styles.companyWorkersLabel}>workers</Text>
-        {showStock ? <CompanyStockPrice company={row.label} /> : null}
-      </View>
-    </View>
-  );
-}
-
-function CompanyStockPrice({ company }: { company: string }) {
-  const ticker = guessCompanyTicker(company);
+function CompanyRow({ index, logoRefreshKey, row, showStock = false, isExpanded = false, onToggle }: { index: number; logoRefreshKey?: number; row: RankedRow; showStock?: boolean; isExpanded?: boolean; onToggle?: () => void }) {
+  const ticker = row.ticker || guessCompanyTicker(row.label);
   const [quote, setQuote] = useState<StockQuote | null>(null);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
+    if (!showStock || !ticker) {
+      return;
+    }
+
     let active = true;
 
     async function loadQuote() {
-      if (!ticker) {
-        setFailed(true);
-        return;
-      }
-
       try {
         const response = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`, {
           headers: {
@@ -966,6 +921,7 @@ function CompanyStockPrice({ company }: { company: string }) {
           marketState: result.marketState ?? '',
           price,
           regularMarketChangePercent: changePercent,
+          regularMarketTime: result.regularMarketTime,
           symbol: result.symbol ?? ticker,
         });
       } catch {
@@ -976,25 +932,108 @@ function CompanyStockPrice({ company }: { company: string }) {
     }
 
     loadQuote();
+    const refreshInterval = setInterval(() => {
+      if (active) {
+        loadQuote();
+      }
+    }, 1000);
+
     return () => {
       active = false;
+      clearInterval(refreshInterval);
     };
-  }, [ticker]);
+  }, [showStock, ticker]);
 
-  if (!ticker || failed) {
-    return null;
-  }
-
-  if (!quote) {
-    return <Text style={styles.stockText}>{ticker}</Text>;
-  }
-
-  const direction = Number.isFinite(quote.regularMarketChangePercent ?? NaN) && (quote.regularMarketChangePercent ?? 0) >= 0;
+  const direction = quote && Number.isFinite(quote.regularMarketChangePercent ?? NaN) && (quote.regularMarketChangePercent ?? 0) >= 0;
 
   return (
-    <Text style={[styles.stockText, direction ? styles.stockUp : styles.stockDown]} numberOfLines={1}>
-      {quote.symbol} {formatCurrency(quote.price, quote.currency)}
-    </Text>
+    <View>
+      <Pressable
+        onPress={onToggle}
+        style={[styles.companyRow, isExpanded && styles.companyRowExpanded]}
+      >
+        <View style={styles.logoStack}>
+          <CompanyLogo company={row.label} refreshKey={logoRefreshKey} />
+          <View style={styles.rankBadge}>
+            <Text style={styles.rankBadgeText}>{index + 1}</Text>
+          </View>
+        </View>
+        <View style={styles.companyMain}>
+          <Text style={styles.companyName} numberOfLines={1}>
+            {row.label}
+          </Text>
+          <Text style={styles.companyMeta} numberOfLines={1}>
+            {row.notices.toLocaleString()} notices{row.meta ? ` / ${row.meta}` : ''}
+          </Text>
+        </View>
+        <View style={styles.companyImpact}>
+          <Text style={styles.companyWorkers}>{row.value.toLocaleString()}</Text>
+          <Text style={styles.companyWorkersLabel}>workers</Text>
+          {showStock && ticker && !failed && quote && (
+            <Text style={[styles.stockText, direction ? styles.stockUp : styles.stockDown]} numberOfLines={1}>
+              {quote.symbol} {formatCurrency(quote.price, quote.currency)}
+            </Text>
+          )}
+        </View>
+        {onToggle && (
+          <Text style={styles.expandIndicator}>{isExpanded ? '▼' : '▶'}</Text>
+        )}
+      </Pressable>
+      {isExpanded && (
+        <View style={styles.companyDetails}>
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Company</Text>
+            <Text style={styles.detailValue}>{row.label}</Text>
+          </View>
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Total Notices</Text>
+            <Text style={styles.detailValue}>{row.notices.toLocaleString()}</Text>
+          </View>
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Total Workers Affected</Text>
+            <Text style={styles.detailValue}>{row.value.toLocaleString()}</Text>
+          </View>
+          {row.meta && (
+            <View style={styles.detailRow}>
+              <Text style={styles.detailLabel}>States</Text>
+              <Text style={styles.detailValue}>{row.meta}</Text>
+            </View>
+          )}
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Average per Notice</Text>
+            <Text style={styles.detailValue}>{Math.round(row.value / row.notices).toLocaleString()}</Text>
+          </View>
+          {showStock && ticker && !failed && quote && (
+            <>
+              <View style={styles.detailRow}>
+                <Text style={styles.detailLabel}>Stock Symbol</Text>
+                <Text style={styles.detailValue}>{quote.symbol}</Text>
+              </View>
+              <View style={styles.detailRow}>
+                <Text style={styles.detailLabel}>Stock Price</Text>
+                <Text style={[styles.detailValue, direction ? styles.stockUp : styles.stockDown]}>
+                  {formatCurrency(quote.price, quote.currency)}
+                  {Number.isFinite(quote.regularMarketChangePercent) && ` (${direction ? '+' : ''}${quote.regularMarketChangePercent?.toFixed(2)}%)`}
+                </Text>
+              </View>
+              {quote.regularMarketTime && (
+                <View style={styles.detailRow}>
+                  <Text style={styles.detailLabel}>Price Updated</Text>
+                  <Text style={styles.detailValue}>
+                    {new Date(quote.regularMarketTime * 1000).toLocaleString('en-US', {
+                      month: 'short',
+                      day: 'numeric',
+                      hour: 'numeric',
+                      minute: '2-digit',
+                    })}
+                  </Text>
+                </View>
+              )}
+            </>
+          )}
+        </View>
+      )}
+    </View>
   );
 }
 
@@ -1030,26 +1069,99 @@ function BarList({ rows }: { rows: RankedRow[] }) {
   );
 }
 
-function NoticeRow({ notice }: { notice: WarnNotice }) {
+function HorizontalBarList({ rows }: { rows: RankedRow[] }) {
+  if (!rows.length) {
+    return <Text style={styles.emptyText}>No telemetry available.</Text>;
+  }
+
+  const max = Math.max(...rows.map((row) => row.value), 1);
+
   return (
-    <View style={styles.noticeRow}>
-      <View style={styles.noticeDateBlock}>
-        <Text style={styles.noticeMonth}>{formatMonth(notice.date)}</Text>
-        <Text style={styles.noticeDay}>{formatDay(notice.date)}</Text>
-      </View>
-      <CompanyLogo company={notice.company} />
-      <View style={styles.noticeMain}>
-        <Text style={styles.noticeCompany} numberOfLines={1}>
-          {notice.company}
-        </Text>
-        <Text style={styles.noticeMeta} numberOfLines={1}>
-          {notice.city}, {notice.state} / {notice.industry}
-        </Text>
-      </View>
-      <View style={styles.noticeImpact}>
-        <Text style={styles.noticeEmployees}>{notice.employees.toLocaleString()}</Text>
-        <Text style={styles.noticeEmployeesLabel}>workers</Text>
-      </View>
+    <ScrollView
+      horizontal
+      showsHorizontalScrollIndicator={false}
+      contentContainerStyle={styles.horizontalBarList}
+    >
+      {rows.map((row, index) => (
+        <View key={row.label} style={styles.horizontalBarCard}>
+          <Text style={styles.horizontalBarLabel} numberOfLines={2}>
+            {row.label}
+          </Text>
+          <Text style={styles.horizontalBarValue}>{row.value.toLocaleString()}</Text>
+          <Text style={styles.horizontalBarSubtext}>workers</Text>
+          <View style={styles.horizontalBarTrack}>
+            <View
+              style={[
+                styles.horizontalBarFill,
+                {
+                  backgroundColor: index === 0 ? palette.red : palette.ink,
+                  height: `${Math.max((row.value / max) * 100, 5)}%`,
+                },
+              ]}
+            />
+          </View>
+        </View>
+      ))}
+    </ScrollView>
+  );
+}
+
+function NoticeRow({ logoRefreshKey, notice, isExpanded = false, onToggle }: { logoRefreshKey?: number; notice: WarnNotice; isExpanded?: boolean; onToggle?: () => void }) {
+  return (
+    <View>
+      <Pressable
+        onPress={onToggle}
+        style={[styles.noticeRow, isExpanded && styles.noticeRowExpanded]}
+      >
+        <View style={styles.noticeDateBlock}>
+          <Text style={styles.noticeMonth}>{formatMonth(notice.date)}</Text>
+          <Text style={styles.noticeDay}>{formatDay(notice.date)}</Text>
+        </View>
+        <CompanyLogo company={notice.company} refreshKey={logoRefreshKey} />
+        <View style={styles.noticeMain}>
+          <Text style={styles.noticeCompany} numberOfLines={1}>
+            {notice.company}
+          </Text>
+          <Text style={styles.noticeMeta} numberOfLines={1}>
+            {notice.city}, {notice.state} / {notice.industry}
+          </Text>
+        </View>
+        <View style={styles.noticeImpact}>
+          <Text style={styles.noticeEmployees}>{notice.employees.toLocaleString()}</Text>
+          <Text style={styles.noticeEmployeesLabel}>workers</Text>
+        </View>
+        {onToggle && (
+          <Text style={styles.expandIndicator}>{isExpanded ? '▼' : '▶'}</Text>
+        )}
+      </Pressable>
+      {isExpanded && (
+        <View style={styles.companyDetails}>
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Company</Text>
+            <Text style={styles.detailValue}>{notice.company}</Text>
+          </View>
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Date</Text>
+            <Text style={styles.detailValue}>{new Date(notice.date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}</Text>
+          </View>
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Location</Text>
+            <Text style={styles.detailValue}>{notice.city}, {notice.state}</Text>
+          </View>
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Industry</Text>
+            <Text style={styles.detailValue}>{notice.industry}</Text>
+          </View>
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Workers Affected</Text>
+            <Text style={styles.detailValue}>{notice.employees.toLocaleString()}</Text>
+          </View>
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Reason</Text>
+            <Text style={styles.detailValue}>{notice.reason}</Text>
+          </View>
+        </View>
+      )}
     </View>
   );
 }
@@ -1074,94 +1186,16 @@ function buildAnalytics(notices: WarnNotice[]) {
     averageImpact: notices.length ? Math.round(totalEmployees / notices.length) : 0,
     last7: summarize(last7Notices),
     last30: summarize(last30Notices),
-    topCompanies7: rankGroups(groupBy(last7Notices, (notice) => notice.company)).slice(0, 100),
-    topCompanies30: rankGroups(groupBy(last30Notices, (notice) => notice.company)).slice(0, 100),
-    topCompaniesAll: rankGroups(companies).slice(0, 100),
-    topStates7: rankGroups(groupBy(last7Notices, (notice) => notice.state || 'NA')).slice(0, 8),
-    topStates: rankGroups(states).slice(0, 8),
-    topIndustries30: rankGroups(groupBy(last30Notices, (notice) => notice.industry || 'Unclassified')).slice(0, 8),
-    topIndustries: rankGroups(industries).slice(0, 8),
+    topCompanies7: rankGroups(groupBy(last7Notices, (notice) => notice.company)),
+    topCompanies30: rankGroups(groupBy(last30Notices, (notice) => notice.company)),
+    topCompaniesAll: rankGroups(companies),
+    topStates7: rankGroups(groupBy(last7Notices, (notice) => notice.state || 'NA')),
+    topStates: rankGroups(states),
+    topIndustries7: rankGroups(groupBy(last7Notices, (notice) => notice.industry || 'Unclassified')),
+    topIndustries30: rankGroups(groupBy(last30Notices, (notice) => notice.industry || 'Unclassified')),
+    topIndustries: rankGroups(industries),
     recentNotices: sorted.slice(0, 25),
   };
-}
-
-async function scheduleWeeklyAlerts(topics: AlertTopicKey[], analytics: Analytics) {
-  await clearScheduledAlertNotifications();
-
-  const ids: string[] = [];
-  for (const topic of topics) {
-    const content = buildNotificationContent(topic, analytics);
-    const id = await Notifications.scheduleNotificationAsync({
-      content,
-      trigger: {
-        type: Notifications.SchedulableTriggerInputTypes.WEEKLY,
-        weekday: 2,
-        hour: 9,
-        minute: 0,
-      },
-    });
-    ids.push(id);
-  }
-
-  return ids;
-}
-
-async function sendImmediateAlertPreview(topics: AlertTopicKey[], analytics: Analytics) {
-  for (const topic of topics) {
-    await Notifications.scheduleNotificationAsync({
-      content: buildNotificationContent(topic, analytics),
-      trigger: null,
-    });
-  }
-}
-
-async function clearScheduledAlertNotifications() {
-  const storedIds = await AsyncStorage.getItem(ALERT_NOTIFICATION_IDS_KEY);
-  if (!storedIds) {
-    return;
-  }
-
-  const ids = JSON.parse(storedIds) as string[];
-  await Promise.all(ids.map((id) => Notifications.cancelScheduledNotificationAsync(id)));
-  await AsyncStorage.removeItem(ALERT_NOTIFICATION_IDS_KEY);
-}
-
-function buildNotificationContent(topic: AlertTopicKey, analytics: Analytics) {
-  switch (topic) {
-    case 'weeklyCompanies': {
-      const top = analytics.topCompanies7[0];
-      return {
-        title: 'Top WARN company this week',
-        body: top ? `${top.label}: ${top.value.toLocaleString()} workers across ${top.notices} notices.` : 'No WARN company movement in the last 7 days.',
-      };
-    }
-    case 'monthlyCompanies': {
-      const top = analytics.topCompanies30[0];
-      return {
-        title: 'Top WARN company this month',
-        body: top ? `${top.label}: ${top.value.toLocaleString()} workers across ${top.notices} notices.` : 'No WARN company movement in the last 30 days.',
-      };
-    }
-    case 'weeklyRegions': {
-      const top = analytics.topStates7[0] ?? analytics.topStates[0];
-      return {
-        title: 'Top WARN region',
-        body: top ? `${top.label}: ${top.value.toLocaleString()} affected workers.` : 'No regional WARN movement available.',
-      };
-    }
-    case 'monthlyIndustries': {
-      const top = analytics.topIndustries30[0] ?? analytics.topIndustries[0];
-      return {
-        title: 'Top WARN industry',
-        body: top ? `${top.label}: ${top.value.toLocaleString()} affected workers.` : 'No industry WARN movement available.',
-      };
-    }
-    case 'weeklyDigest':
-      return {
-        title: 'Weekly WARN digest',
-        body: `${analytics.last7.notices.toLocaleString()} notices, ${analytics.last7.employees.toLocaleString()} workers, ${analytics.stateCount.toLocaleString()} states tracked.`,
-      };
-  }
 }
 
 function summarize(records: WarnNotice[]) {
@@ -1183,6 +1217,30 @@ function getCompanyRowsForRange(analytics: Analytics, range: CompanyRangeKey) {
   return analytics.topCompaniesAll;
 }
 
+function getRegionRowsForRange(analytics: Analytics, range: CompanyRangeKey) {
+  if (range === '7d') {
+    return analytics.topStates7;
+  }
+
+  if (range === '30d') {
+    return analytics.topStates;
+  }
+
+  return analytics.topStates;
+}
+
+function getIndustryRowsForRange(analytics: Analytics, range: CompanyRangeKey) {
+  if (range === '7d') {
+    return analytics.topIndustries7;
+  }
+
+  if (range === '30d') {
+    return analytics.topIndustries30;
+  }
+
+  return analytics.topIndustries;
+}
+
 function companyRangeTitle(range: CompanyRangeKey) {
   if (range === '7d') {
     return 'Top companies, last 7 days';
@@ -1197,8 +1255,8 @@ function companyRangeTitle(range: CompanyRangeKey) {
 
 function getNoticesForRange(notices: WarnNotice[], range: NoticeRangeKey) {
   const sorted = [...notices].sort((a, b) => toTime(b.date) - toTime(a.date));
-  if (range === 'recent') {
-    return sorted.slice(0, 25);
+  if (range === '7d') {
+    return filterWithinDays(sorted, 7);
   }
 
   if (range === '30d') {
@@ -1209,15 +1267,51 @@ function getNoticesForRange(notices: WarnNotice[], range: NoticeRangeKey) {
 }
 
 function noticeRangeTitle(range: NoticeRangeKey) {
+  if (range === '7d') {
+    return 'WARN notices, last 7 days';
+  }
+
   if (range === '30d') {
     return 'WARN notices, last 30 days';
   }
 
-  if (range === 'all') {
-    return 'WARN notices, all time';
+  return 'WARN notices, all time';
+}
+
+function getMomentumTitle(range: CompanyRangeKey) {
+  if (range === '7d') {
+    return 'Top 5 companies, last 7 days';
   }
 
-  return 'Recent WARN notices';
+  if (range === '30d') {
+    return 'Top 5 companies, last 30 days';
+  }
+
+  return 'Top 5 companies, all time';
+}
+
+function getRegionsTitle(range: CompanyRangeKey) {
+  if (range === '7d') {
+    return 'Top 5 regions, last 7 days';
+  }
+
+  if (range === '30d') {
+    return 'Top 5 regions, last 30 days';
+  }
+
+  return 'Top 5 regions, all time';
+}
+
+function getIndustriesTitle(range: CompanyRangeKey) {
+  if (range === '7d') {
+    return 'Top 5 industries, last 7 days';
+  }
+
+  if (range === '30d') {
+    return 'Top 5 industries, last 30 days';
+  }
+
+  return 'Top 5 industries, all time';
 }
 
 function filterRankedRows(rows: RankedRow[], query: string) {
@@ -1242,12 +1336,18 @@ function filterNotices(notices: WarnNotice[], query: string) {
 
 function rankGroups(groups: Record<string, WarnNotice[]>): RankedRow[] {
   return Object.entries(groups)
-    .map(([label, group]) => ({
-      label,
-      value: group.reduce((sum, notice) => sum + notice.employees, 0),
-      notices: group.length,
-      meta: compactUnique(group.map((notice) => notice.state)).slice(0, 3).join(', '),
-    }))
+    .map(([label, group]) => {
+      // Find the first ticker in this group
+      const ticker = group.find((notice) => notice.ticker)?.ticker;
+
+      return {
+        label,
+        value: group.reduce((sum, notice) => sum + notice.employees, 0),
+        notices: group.length,
+        meta: compactUnique(group.map((notice) => notice.state)).slice(0, 3).join(', '),
+        ticker: ticker || undefined,
+      };
+    })
     .sort((a, b) => b.value - a.value);
 }
 
@@ -1353,6 +1453,7 @@ function normalizeNotice(record: RawWarnRecord, index: number): WarnNotice | nul
 
   const date = text(record.notice_date, record.date, record.received_date, record.effective_date, record.layoff_date);
   const state = text(record.state, record.state_code, record.location_state).toUpperCase();
+  const ticker = text(record.ticker);
 
   return {
     id: text(record.id, record.record_id, record.notice_id) || `${company}-${date}-${index}`,
@@ -1363,6 +1464,7 @@ function normalizeNotice(record: RawWarnRecord, index: number): WarnNotice | nul
     date: date || new Date().toISOString(),
     employees: number(record.employees_affected, record.workers_affected, record.employees, record.total_layoffs, record.count),
     reason: text(record.reason, record.closure_type, record.notice_type, record.type) || 'WARN notice',
+    ticker: ticker || undefined,
   };
 }
 
@@ -1383,7 +1485,28 @@ function toTime(date: string) {
 
 function shouldRefreshCache(savedAt: string) {
   const savedTime = new Date(savedAt).getTime();
-  return Number.isNaN(savedTime) || Date.now() - savedTime >= CACHE_REFRESH_INTERVAL_MS;
+  if (Number.isNaN(savedTime)) {
+    return true;
+  }
+
+  const now = new Date();
+  const timeSinceSave = now.getTime() - savedTime;
+
+  // If data is less than 24 hours old, don't refresh
+  if (timeSinceSave < CACHE_REFRESH_INTERVAL_MS) {
+    return false;
+  }
+
+  // If data is more than 24 hours old, check if we've passed 7 AM today
+  const todayAt7AM = new Date();
+  todayAt7AM.setHours(CACHE_REFRESH_HOUR, 0, 0, 0);
+
+  // If current time is past 7 AM today and last save was before 7 AM today, refresh
+  if (now.getTime() >= todayAt7AM.getTime() && savedTime < todayAt7AM.getTime()) {
+    return true;
+  }
+
+  return false;
 }
 
 function formatUpdateTime(date: string) {
@@ -1477,14 +1600,31 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: palette.ink,
     borderRadius: 8,
-    height: 44,
+    height: 55,
     justifyContent: 'center',
-    width: 44,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    width: 62,
+  },
+  headerSearchInput: {
+    backgroundColor: palette.panel,
+    borderColor: palette.faint,
+    borderRadius: 8,
+    borderWidth: 1,
+    color: palette.ink,
+    flex: 1,
+    fontSize: 15,
+    fontWeight: '800',
+    minHeight: 44,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
   },
   logoText: {
     color: palette.panel,
-    fontSize: 24,
+    fontSize: 11,
     fontWeight: '900',
+    lineHeight: 13,
+    textAlign: 'center',
   },
   headerCopy: {
     flex: 1,
@@ -1506,7 +1646,7 @@ const styles = StyleSheet.create({
     borderColor: palette.faint,
     borderRadius: 8,
     borderWidth: 1,
-    minWidth: 112,
+    flex: 1,
     paddingHorizontal: 12,
     paddingVertical: 9,
   },
@@ -1666,6 +1806,45 @@ const styles = StyleSheet.create({
     gap: 12,
     paddingVertical: 12,
   },
+  companyRowExpanded: {
+    backgroundColor: palette.soft,
+    borderBottomWidth: 0,
+    borderRadius: 8,
+    marginHorizontal: -8,
+    paddingHorizontal: 20,
+  },
+  expandIndicator: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '700',
+    marginLeft: 4,
+  },
+  companyDetails: {
+    backgroundColor: palette.panel,
+    borderBottomColor: palette.faint,
+    borderBottomWidth: 1,
+    gap: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  detailRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  detailLabel: {
+    color: palette.muted,
+    fontSize: 13,
+    fontWeight: '700',
+    flex: 1,
+  },
+  detailValue: {
+    color: palette.ink,
+    fontSize: 13,
+    fontWeight: '900',
+    flex: 2,
+    textAlign: 'right',
+  },
   logoStack: {
     alignItems: 'center',
     flexDirection: 'row',
@@ -1749,106 +1928,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 20,
   },
-  alertIntro: {
-    color: palette.muted,
-    fontSize: 14,
-    lineHeight: 20,
-    marginBottom: 14,
-  },
-  topicList: {
-    gap: 10,
-    marginTop: 14,
-  },
-  topicRow: {
-    alignItems: 'center',
-    borderColor: palette.faint,
-    borderRadius: 8,
-    borderWidth: 1,
-    flexDirection: 'row',
-    gap: 12,
-    padding: 12,
-  },
-  topicRowSelected: {
-    backgroundColor: palette.redSoft,
-    borderColor: '#ffc9bc',
-  },
-  checkbox: {
-    alignItems: 'center',
-    backgroundColor: palette.panel,
-    borderColor: palette.faint,
-    borderRadius: 6,
-    borderWidth: 1,
-    height: 30,
-    justifyContent: 'center',
-    width: 30,
-  },
-  checkboxSelected: {
-    backgroundColor: palette.red,
-    borderColor: palette.red,
-  },
-  checkboxText: {
-    color: palette.muted,
-    fontSize: 10,
-    fontWeight: '900',
-    textTransform: 'uppercase',
-  },
-  checkboxTextSelected: {
-    color: palette.panel,
-  },
-  topicCopy: {
-    flex: 1,
-  },
-  topicLabel: {
-    color: palette.ink,
-    fontSize: 14,
-    fontWeight: '900',
-  },
-  topicDescription: {
-    color: palette.muted,
-    fontSize: 12,
-    lineHeight: 17,
-    marginTop: 3,
-  },
-  alertActions: {
-    gap: 10,
-    marginTop: 16,
-  },
-  primaryButton: {
-    alignItems: 'center',
-    backgroundColor: palette.ink,
-    borderRadius: 8,
-    minHeight: 44,
-    justifyContent: 'center',
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-  },
-  primaryButtonText: {
-    color: palette.panel,
-    fontSize: 14,
-    fontWeight: '900',
-  },
-  secondaryButton: {
-    alignItems: 'center',
-    backgroundColor: palette.panel,
-    borderColor: palette.faint,
-    borderRadius: 8,
-    borderWidth: 1,
-    minHeight: 44,
-    justifyContent: 'center',
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-  },
-  secondaryButtonText: {
-    color: palette.ink,
-    fontSize: 14,
-    fontWeight: '900',
-  },
-  statusText: {
-    color: palette.muted,
-    fontSize: 12,
-    lineHeight: 18,
-    marginTop: 12,
-  },
   barList: {
     gap: 14,
   },
@@ -1881,6 +1960,52 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     height: 8,
   },
+  horizontalBarList: {
+    gap: 12,
+    paddingRight: 16,
+  },
+  horizontalBarCard: {
+    backgroundColor: palette.soft,
+    borderColor: palette.faint,
+    borderRadius: 8,
+    borderWidth: 1,
+    minHeight: 160,
+    padding: 12,
+    width: 120,
+  },
+  horizontalBarLabel: {
+    color: palette.ink,
+    fontSize: 13,
+    fontWeight: '900',
+    height: 36,
+    lineHeight: 17,
+  },
+  horizontalBarValue: {
+    color: palette.red,
+    fontSize: 18,
+    fontWeight: '900',
+    marginTop: 4,
+  },
+  horizontalBarSubtext: {
+    color: palette.muted,
+    fontSize: 10,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  horizontalBarTrack: {
+    alignItems: 'center',
+    backgroundColor: palette.panel,
+    borderRadius: 6,
+    flex: 1,
+    justifyContent: 'flex-end',
+    marginTop: 12,
+    overflow: 'hidden',
+    width: '100%',
+  },
+  horizontalBarFill: {
+    borderRadius: 6,
+    width: '100%',
+  },
   noticeRow: {
     alignItems: 'center',
     borderBottomColor: palette.faint,
@@ -1888,6 +2013,13 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 12,
     paddingVertical: 13,
+  },
+  noticeRowExpanded: {
+    backgroundColor: palette.soft,
+    borderBottomWidth: 0,
+    borderRadius: 8,
+    marginHorizontal: -8,
+    paddingHorizontal: 20,
   },
   noticeDateBlock: {
     alignItems: 'center',
@@ -1934,5 +2066,32 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '700',
     marginTop: 2,
+  },
+  horizontalSectionsContainer: {
+    gap: 12,
+    paddingRight: 18,
+  },
+  horizontalSection: {
+    backgroundColor: palette.panel,
+    borderColor: palette.faint,
+    borderRadius: 8,
+    borderWidth: 1,
+    padding: 16,
+    width: 340,
+  },
+  horizontalSectionEyebrow: {
+    color: palette.red,
+    fontSize: 11,
+    fontWeight: '900',
+    textTransform: 'uppercase',
+  },
+  horizontalSectionTitle: {
+    color: palette.ink,
+    fontSize: 20,
+    fontWeight: '900',
+    marginTop: 3,
+  },
+  horizontalSectionBody: {
+    marginTop: 14,
   },
 });

@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "2026-04-19-set-up-a-react-native-expo-2",
-    "slug": "2026-04-19-set-up-a-react-native-expo-2",
+    "name": "bWARNed",
+    "slug": "bwarned",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -13,9 +13,11 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.bwarned.app"
     },
     "android": {
+      "package": "com.bwarned.app",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
