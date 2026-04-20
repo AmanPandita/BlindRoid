@@ -7,6 +7,7 @@ import {
   ActivityIndicator,
   Image,
   Linking,
+  Platform,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -496,15 +497,26 @@ function Header({ searchValue, onSearchChange, searchPlaceholder }: { searchValu
           <Text style={styles.logoText}>b{'\n'}WARN{'\n'}ed</Text>
         </View>
         {onSearchChange && (
-          <TextInput
-            autoCapitalize="none"
-            clearButtonMode="while-editing"
-            onChangeText={onSearchChange}
-            placeholder={searchPlaceholder || "Search"}
-            placeholderTextColor={palette.muted}
-            style={styles.headerSearchInput}
-            value={searchValue}
-          />
+          <View style={styles.searchInputContainer}>
+            <TextInput
+              autoCapitalize="none"
+              clearButtonMode={Platform.OS === 'ios' ? 'while-editing' : 'never'}
+              onChangeText={onSearchChange}
+              placeholder={searchPlaceholder || "Search"}
+              placeholderTextColor={palette.muted}
+              style={styles.headerSearchInput}
+              value={searchValue}
+            />
+            {Platform.OS === 'android' && searchValue && searchValue.length > 0 && (
+              <Pressable
+                onPress={() => onSearchChange('')}
+                style={styles.clearButton}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              >
+                <Text style={styles.clearButtonText}>✕</Text>
+              </Pressable>
+            )}
+          </View>
         )}
       </View>
     </View>
@@ -830,7 +842,6 @@ function RedditScreenWrapper() {
       if (cached) {
         const cachedPosts = JSON.parse(cached) as RedditPost[];
         setPosts(cachedPosts);
-        setLoading(false);
         return;
       }
 
@@ -838,6 +849,7 @@ function RedditScreenWrapper() {
       await fetchRedditPosts();
     } catch (err) {
       setError(getErrorMessage(err));
+    } finally {
       setLoading(false);
     }
   }
@@ -1947,6 +1959,10 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
     width: 62,
   },
+  searchInputContainer: {
+    flex: 1,
+    position: 'relative',
+  },
   headerSearchInput: {
     backgroundColor: palette.panel,
     borderColor: palette.faint,
@@ -1958,7 +1974,22 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     minHeight: 44,
     paddingHorizontal: 12,
+    paddingRight: 40,
     paddingVertical: 10,
+  },
+  clearButton: {
+    alignItems: 'center',
+    height: 44,
+    justifyContent: 'center',
+    position: 'absolute',
+    right: 0,
+    top: 0,
+    width: 44,
+  },
+  clearButtonText: {
+    color: palette.muted,
+    fontSize: 18,
+    fontWeight: '700',
   },
   logoText: {
     color: palette.panel,
