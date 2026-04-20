@@ -1979,7 +1979,7 @@ const styles = StyleSheet.create({
   },
   clearButton: {
     alignItems: 'center',
-    height: 44,
+    bottom: 0,
     justifyContent: 'center',
     position: 'absolute',
     right: 0,
