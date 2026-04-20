@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { supabase } from './utils/supabase';
 import { createBottomTabNavigator, useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import { createMaterialTopTabNavigator } from '@react-navigation/material-top-tabs';
 import { createNavigationContainerRef, NavigationContainer } from '@react-navigation/native';
@@ -25,6 +26,8 @@ declare const process: {
     EXPO_PUBLIC_WARN_FIREHOSE_API_KEY?: string;
     EXPO_PUBLIC_REDDIT_CLIENT_ID?: string;
     EXPO_PUBLIC_REDDIT_CLIENT_SECRET?: string;
+    EXPO_PUBLIC_SUPABASE_URL?: string;
+    EXPO_PUBLIC_SUPABASE_KEY?: string;
   };
 };
 
@@ -87,16 +90,9 @@ type RedditPost = {
   company?: string;
 };
 
-const WARN_API_KEY = process.env.EXPO_PUBLIC_WARN_FIREHOSE_API_KEY;
-const WARN_BASE_ENDPOINT = 'https://warnfirehose.com/api/records';
-const PAGE_LIMIT = 25;
-const MAX_API_CALLS = 20;
 const CACHE_KEY = 'warnfirehose.warn_notices.v1';
 const REDDIT_CACHE_KEY = 'warnfirehose.reddit_posts.v1';
 const REDDIT_LAST_FETCH_KEY = 'warnfirehose.reddit_last_fetch.v1';
-const CACHE_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
-const CACHE_REFRESH_CHECK_MS = 60 * 1000; // Check every minute
-const CACHE_REFRESH_HOUR = 7; // 7 AM
 const REDDIT_REFRESH_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes cooldown between refreshes
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -265,116 +261,96 @@ export default function App() {
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [totalViewCount, setTotalViewCount] = useState(0);
 
   useEffect(() => {
-    loadCachedOrFetch();
-    const refreshTimer = setInterval(() => {
-      refreshCacheIfDue().catch((nextError) => setError(getErrorMessage(nextError)));
-    }, CACHE_REFRESH_CHECK_MS);
+    loadCachedThenRefresh();
+  }, []);
 
-    return () => clearInterval(refreshTimer);
+  useEffect(() => {
+    // Fetch current total count
+    supabase
+      .from('app_opens')
+      .select('*', { count: 'exact', head: true })
+      .then(({ count }) => {
+        if (count !== null) setTotalViewCount(count);
+      });
+
+    // Increment counter by inserting a new row
+    supabase.from('app_opens').insert({ opened_at: new Date().toISOString() });
+
+    // Subscribe to real-time inserts to update the count dynamically
+    const channel = supabase
+      .channel('app_opens_changes')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'app_opens' }, () => {
+        setTotalViewCount((prev) => prev + 1);
+      })
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
   }, []);
 
   const analytics = useMemo(() => buildAnalytics(notices), [notices]);
 
-  async function loadCachedOrFetch() {
+  async function loadCachedThenRefresh() {
     setLoading(true);
     setError(null);
-    let hasCachedData = false;
 
+    // Show cached data immediately while the DB fetch runs
     try {
       const cached = await AsyncStorage.getItem(CACHE_KEY);
       if (cached) {
         const payload = JSON.parse(cached) as CachePayload;
-        hasCachedData = Boolean(payload.notices.length);
-        setNotices(payload.notices);
-        setLastUpdatedAt(payload.savedAt);
-
-        if (!shouldRefreshCache(payload.savedAt)) {
-          return;
+        if (payload.notices.length) {
+          setNotices(payload.notices);
+          setLastUpdatedAt(payload.savedAt);
+          setLoading(false); // show stale data right away
         }
       }
+    } catch {
+      // ignore cache read errors
+    }
 
+    // Always fetch fresh from Supabase — DB is always up to date via the sync script
+    try {
       await fetchAndCache();
     } catch (nextError) {
       setError(getErrorMessage(nextError));
-      if (!hasCachedData) {
-        setNotices(sampleNotices);
-      }
+      // If we have no data at all yet, fall back to sample notices
+      setNotices((current) => (current.length ? current : sampleNotices));
     } finally {
       setLoading(false);
     }
   }
 
   async function fetchAndCache() {
-    if (!WARN_API_KEY) {
-      throw new Error('Missing EXPO_PUBLIC_WARN_FIREHOSE_API_KEY in .env');
-    }
+    const allRecords: WarnNotice[] = [];
+    let from = 0;
+    const pageSize = 1000;
 
-    let allRecords: WarnNotice[] = [];
-    let offset = 0;
-    let total = 0;
-    let apiCallCount = 0;
+    while (true) {
+      const { data, error: queryError } = await supabase
+        .from('warn_notices')
+        .select('*')
+        .order('date', { ascending: false })
+        .range(from, from + pageSize - 1);
 
-    // Fetch first page to get total count
-    const firstResponse = await fetch(`${WARN_BASE_ENDPOINT}?limit=${PAGE_LIMIT}&offset=${offset}`, {
-      headers: {
-        'X-API-Key': WARN_API_KEY,
-        Accept: 'application/json',
-      },
-    });
-    apiCallCount++;
+      if (queryError) throw new Error(queryError.message);
+      if (!data || data.length === 0) break;
 
-    if (!firstResponse.ok) {
-      throw new Error(`WARN Firehose returned ${firstResponse.status}`);
-    }
-
-    const firstJson = await firstResponse.json();
-    total = firstJson.total || 0;
-    const firstRecords = extractRecords(firstJson).map(normalizeNotice).filter(Boolean) as WarnNotice[];
-    allRecords = [...firstRecords];
-
-    // Fetch remaining pages, but limit to MAX_API_CALLS total
-    offset += PAGE_LIMIT;
-    while (offset < total && apiCallCount < MAX_API_CALLS) {
-      const response = await fetch(`${WARN_BASE_ENDPOINT}?limit=${PAGE_LIMIT}&offset=${offset}`, {
-        headers: {
-          'X-API-Key': WARN_API_KEY,
-          Accept: 'application/json',
-        },
-      });
-      apiCallCount++;
-
-      if (!response.ok) {
-        throw new Error(`WARN Firehose returned ${response.status} at offset ${offset}`);
-      }
-
-      const json = await response.json();
-      const records = extractRecords(json).map(normalizeNotice).filter(Boolean) as WarnNotice[];
-      allRecords = [...allRecords, ...records];
-      offset += PAGE_LIMIT;
+      allRecords.push(...(data as WarnNotice[]));
+      if (data.length < pageSize) break;
+      from += pageSize;
     }
 
     if (!allRecords.length) {
-      throw new Error('No WARN notices were returned by the API');
+      throw new Error('No WARN notices found in database. Run the sync script to populate data.');
     }
 
     const savedAt = new Date().toISOString();
     await AsyncStorage.setItem(CACHE_KEY, JSON.stringify({ savedAt, notices: allRecords }));
     setNotices(allRecords);
     setLastUpdatedAt(savedAt);
-  }
-
-  async function refreshCacheIfDue() {
-    const cached = await AsyncStorage.getItem(CACHE_KEY);
-    if (cached) {
-      const payload = JSON.parse(cached) as CachePayload;
-      if (!shouldRefreshCache(payload.savedAt)) {
-        return;
-      }
-    }
-
-    await fetchAndCache();
   }
 
   return (
@@ -385,6 +361,7 @@ export default function App() {
           analytics={analytics}
           error={error}
           lastUpdatedAt={lastUpdatedAt}
+          totalViewCount={totalViewCount}
           loading={loading}
           notices={notices}
           totalCount={notices.length}
@@ -398,6 +375,7 @@ function AppTabs({
   analytics,
   error,
   lastUpdatedAt,
+  totalViewCount,
   loading,
   notices,
   totalCount,
@@ -405,6 +383,7 @@ function AppTabs({
   analytics: Analytics;
   error: string | null;
   lastUpdatedAt: string | null;
+  totalViewCount: number;
   loading: boolean;
   notices: WarnNotice[];
   totalCount: number;
@@ -415,7 +394,7 @@ function AppTabs({
 
   return (
     <Tab.Navigator
-      screenOptions={({ route }) => ({
+      screenOptions={({ route }: { route: { name: keyof RootTabParamList } }) => ({
         headerShown: false,
         sceneStyle: {
           backgroundColor: palette.page,
@@ -437,12 +416,12 @@ function AppTabs({
               paddingBottom: insets.bottom,
             },
           ],
-          tabBarIcon: ({ color, focused }) => <TabGlyph color={color} focused={focused} name={route.name as keyof RootTabParamList} />,
+          tabBarIcon: ({ color, focused }: { color: string; focused: boolean; size: number }) => <TabGlyph color={color} focused={focused} name={route.name} />,
         }),
       })}
     >
       <Tab.Screen name="Overview">
-        {() => <OverviewScreenWrapper analytics={analytics} error={error} lastUpdatedAt={lastUpdatedAt} loading={loading} notices={notices} totalCount={totalCount} />}
+        {() => <OverviewScreenWrapper analytics={analytics} error={error} lastUpdatedAt={lastUpdatedAt} totalViewCount={totalViewCount} loading={loading} notices={notices} totalCount={totalCount} />}
       </Tab.Screen>
       <Tab.Screen name="Companies">
         {() => <CompaniesScreenWrapper analytics={analytics} error={error} loading={loading} />}
@@ -598,7 +577,7 @@ function tabIcon(name: keyof RootTabParamList, color: string) {
   }
 }
 
-function OverviewScreenWrapper({ analytics, error, lastUpdatedAt, loading, notices, totalCount }: { analytics: Analytics; error: string | null; lastUpdatedAt: string | null; loading: boolean; notices: WarnNotice[]; totalCount: number }) {
+function OverviewScreenWrapper({ analytics, error, lastUpdatedAt, totalViewCount, loading, notices, totalCount }: { analytics: Analytics; error: string | null; lastUpdatedAt: string | null; totalViewCount: number; loading: boolean; notices: WarnNotice[]; totalCount: number }) {
   const [companyQuery, setCompanyQuery] = useState('');
   const [refreshing, setRefreshing] = useState(false);
   const [logoRefreshKey, setLogoRefreshKey] = useState(0);
@@ -626,6 +605,7 @@ function OverviewScreenWrapper({ analytics, error, lastUpdatedAt, loading, notic
         analytics={localAnalytics}
         companyQuery={companyQuery}
         lastUpdatedAt={lastUpdatedAt}
+        totalViewCount={totalViewCount}
         logoRefreshKey={logoRefreshKey}
         notices={notices}
         totalCount={totalCount}
@@ -634,7 +614,7 @@ function OverviewScreenWrapper({ analytics, error, lastUpdatedAt, loading, notic
   );
 }
 
-function OverviewScreen({ analytics, companyQuery, lastUpdatedAt, logoRefreshKey, notices, totalCount }: { analytics: Analytics; companyQuery: string; lastUpdatedAt: string | null; logoRefreshKey: number; notices: WarnNotice[]; totalCount: number }) {
+function OverviewScreen({ analytics, companyQuery, lastUpdatedAt, totalViewCount, logoRefreshKey, notices, totalCount }: { analytics: Analytics; companyQuery: string; lastUpdatedAt: string | null; totalViewCount: number; logoRefreshKey: number; notices: WarnNotice[]; totalCount: number }) {
   const [range, setRange] = useState<CompanyRangeKey>('30d');
   const isSearching = companyQuery.trim().length > 0;
 
@@ -692,6 +672,9 @@ function OverviewScreen({ analytics, companyQuery, lastUpdatedAt, logoRefreshKey
 
           <View style={styles.metaRow}>
             <MetaPill label="Last updated" value={lastUpdatedAt ? formatUpdateTime(lastUpdatedAt) : 'Pending'} />
+            {totalViewCount > 0 && (
+              <MetaPill label="Total viewers" value={totalViewCount.toLocaleString()} />
+            )}
           </View>
         </>
       )}
@@ -1870,31 +1853,6 @@ function toTime(date: string) {
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
-function shouldRefreshCache(savedAt: string) {
-  const savedTime = new Date(savedAt).getTime();
-  if (Number.isNaN(savedTime)) {
-    return true;
-  }
-
-  const now = new Date();
-  const timeSinceSave = now.getTime() - savedTime;
-
-  // If data is less than 24 hours old, don't refresh
-  if (timeSinceSave < CACHE_REFRESH_INTERVAL_MS) {
-    return false;
-  }
-
-  // If data is more than 24 hours old, check if we've passed 7 AM today
-  const todayAt7AM = new Date();
-  todayAt7AM.setHours(CACHE_REFRESH_HOUR, 0, 0, 0);
-
-  // If current time is past 7 AM today and last save was before 7 AM today, refresh
-  if (now.getTime() >= todayAt7AM.getTime() && savedTime < todayAt7AM.getTime()) {
-    return true;
-  }
-
-  return false;
-}
 
 function formatUpdateTime(date: string) {
   const parsed = new Date(date);
