@@ -653,27 +653,47 @@ function OverviewScreen({ analytics, companyQuery, lastUpdatedAt, totalViewCount
 
       {!isSearching && (
         <>
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.horizontalSectionsContainer}
-          >
-            <View style={styles.horizontalSection}>
-              <Text style={styles.horizontalSectionEyebrow}>Geography</Text>
-              <Text style={styles.horizontalSectionTitle}>{regionsTitle}</Text>
-              <View style={styles.horizontalSectionBody}>
-                <BarList rows={topRegions} />
+          {Platform.OS === 'web' ? (
+            <View style={styles.horizontalSectionsContainerWeb}>
+              <View style={[styles.horizontalSection, styles.horizontalSectionWeb]}>
+                <Text style={styles.horizontalSectionEyebrow}>Geography</Text>
+                <Text style={styles.horizontalSectionTitle}>{regionsTitle}</Text>
+                <View style={styles.horizontalSectionBody}>
+                  <BarList rows={topRegions} />
+                </View>
               </View>
-            </View>
 
-            <View style={styles.horizontalSection}>
-              <Text style={styles.horizontalSectionEyebrow}>Sectors</Text>
-              <Text style={styles.horizontalSectionTitle}>{industriesTitle}</Text>
-              <View style={styles.horizontalSectionBody}>
-                <BarList rows={topIndustries} />
+              <View style={[styles.horizontalSection, styles.horizontalSectionWeb]}>
+                <Text style={styles.horizontalSectionEyebrow}>Sectors</Text>
+                <Text style={styles.horizontalSectionTitle}>{industriesTitle}</Text>
+                <View style={styles.horizontalSectionBody}>
+                  <BarList rows={topIndustries} />
+                </View>
               </View>
             </View>
-          </ScrollView>
+          ) : (
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.horizontalSectionsContainer}
+            >
+              <View style={styles.horizontalSection}>
+                <Text style={styles.horizontalSectionEyebrow}>Geography</Text>
+                <Text style={styles.horizontalSectionTitle}>{regionsTitle}</Text>
+                <View style={styles.horizontalSectionBody}>
+                  <BarList rows={topRegions} />
+                </View>
+              </View>
+
+              <View style={styles.horizontalSection}>
+                <Text style={styles.horizontalSectionEyebrow}>Sectors</Text>
+                <Text style={styles.horizontalSectionTitle}>{industriesTitle}</Text>
+                <View style={styles.horizontalSectionBody}>
+                  <BarList rows={topIndustries} />
+                </View>
+              </View>
+            </ScrollView>
+          )}
 
           <View style={styles.metaRow}>
             <MetaPill label="Last updated" value={lastUpdatedAt ? formatUpdateTime(lastUpdatedAt) : 'Pending'} />
@@ -2457,6 +2477,15 @@ const styles = StyleSheet.create({
   horizontalSectionsContainer: {
     gap: 12,
     paddingRight: 18,
+  },
+  horizontalSectionsContainerWeb: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  horizontalSectionWeb: {
+    flex: 1,
+    width: undefined,
+    alignSelf: 'stretch',
   },
   horizontalSection: {
     backgroundColor: palette.panel,
