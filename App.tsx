@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { createBottomTabNavigator, useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
+import { createMaterialTopTabNavigator } from '@react-navigation/material-top-tabs';
 import { createNavigationContainerRef, NavigationContainer } from '@react-navigation/native';
 import { StatusBar } from 'expo-status-bar';
 import { ReactNode, useEffect, useMemo, useState } from 'react';
@@ -113,7 +114,9 @@ const palette = {
   green: '#12805c',
 };
 
-const Tab = createBottomTabNavigator<RootTabParamList>();
+const BottomTab = createBottomTabNavigator<RootTabParamList>();
+const TopTab = createMaterialTopTabNavigator<RootTabParamList>();
+const Tab = Platform.OS === 'web' ? TopTab : BottomTab;
 const navigationRef = createNavigationContainerRef<RootTabParamList>();
 
 const companyRanges: { key: CompanyRangeKey; label: string }[] = [
@@ -408,6 +411,8 @@ function AppTabs({
 }) {
   const insets = useSafeAreaInsets();
 
+  const isWeb = Platform.OS === 'web';
+
   return (
     <Tab.Navigator
       screenOptions={({ route }) => ({
@@ -417,17 +422,23 @@ function AppTabs({
         },
         tabBarActiveTintColor: palette.red,
         tabBarInactiveTintColor: palette.muted,
-        tabBarIconStyle: styles.navigatorIconSlot,
-        tabBarItemStyle: styles.navigatorItem,
-        tabBarLabelStyle: styles.navigatorLabel,
-        tabBarStyle: [
-          styles.navigatorBar,
-          {
-            height: 48 + insets.bottom,
-            paddingBottom: insets.bottom,
-          },
-        ],
-        tabBarIcon: ({ color, focused }) => <TabGlyph color={color} focused={focused} name={route.name as keyof RootTabParamList} />,
+        ...(isWeb ? {
+          tabBarLabelStyle: styles.navigatorLabel,
+          tabBarStyle: styles.topNavigatorBar,
+          tabBarIndicatorStyle: { backgroundColor: palette.red },
+        } : {
+          tabBarIconStyle: styles.navigatorIconSlot,
+          tabBarItemStyle: styles.navigatorItem,
+          tabBarLabelStyle: styles.navigatorLabel,
+          tabBarStyle: [
+            styles.navigatorBar,
+            {
+              height: 48 + insets.bottom,
+              paddingBottom: insets.bottom,
+            },
+          ],
+          tabBarIcon: ({ color, focused }) => <TabGlyph color={color} focused={focused} name={route.name as keyof RootTabParamList} />,
+        }),
       })}
     >
       <Tab.Screen name="Overview">
@@ -449,15 +460,15 @@ function AppTabs({
   );
 }
 
-function ScreenShell({ children, error, loading, onRefresh, refreshing, searchValue, onSearchChange, searchPlaceholder }: { children: ReactNode; error: string | null; loading: boolean; onRefresh?: () => void; refreshing?: boolean; searchValue?: string; onSearchChange?: (value: string) => void; searchPlaceholder?: string }) {
-  const tabBarHeight = useBottomTabBarHeight();
+function ScreenShell({ children, error, loading, onRefresh, refreshing, searchValue, onSearchChange, searchPlaceholder, showRefreshButton }: { children: ReactNode; error: string | null; loading: boolean; onRefresh?: () => void; refreshing?: boolean; searchValue?: string; onSearchChange?: (value: string) => void; searchPlaceholder?: string; showRefreshButton?: boolean }) {
+  const tabBarHeight = Platform.OS === 'web' ? 0 : useBottomTabBarHeight();
 
   return (
     <SafeAreaView edges={['top']} style={styles.safeArea}>
       <ScrollView
         contentContainerStyle={[styles.content, { paddingBottom: tabBarHeight + 18 }]}
         refreshControl={
-          onRefresh ? (
+          onRefresh && Platform.OS !== 'web' ? (
             <RefreshControl
               refreshing={refreshing || false}
               onRefresh={onRefresh}
@@ -468,7 +479,7 @@ function ScreenShell({ children, error, loading, onRefresh, refreshing, searchVa
         }
         showsVerticalScrollIndicator={false}
       >
-        <Header searchValue={searchValue} onSearchChange={onSearchChange} searchPlaceholder={searchPlaceholder} />
+        <Header searchValue={searchValue} onSearchChange={onSearchChange} searchPlaceholder={searchPlaceholder} showRefreshButton={showRefreshButton} onRefresh={onRefresh} refreshing={refreshing} />
         {loading ? (
           <View style={styles.loadingPanel}>
             <ActivityIndicator color={palette.red} size="large" />
@@ -489,7 +500,7 @@ function ScreenShell({ children, error, loading, onRefresh, refreshing, searchVa
   );
 }
 
-function Header({ searchValue, onSearchChange, searchPlaceholder }: { searchValue?: string; onSearchChange?: (value: string) => void; searchPlaceholder?: string }) {
+function Header({ searchValue, onSearchChange, searchPlaceholder, showRefreshButton, onRefresh, refreshing }: { searchValue?: string; onSearchChange?: (value: string) => void; searchPlaceholder?: string; showRefreshButton?: boolean; onRefresh?: () => void; refreshing?: boolean }) {
   return (
     <View style={styles.header}>
       <View style={styles.logoRow}>
@@ -517,6 +528,15 @@ function Header({ searchValue, onSearchChange, searchPlaceholder }: { searchValu
               </Pressable>
             )}
           </View>
+        )}
+        {showRefreshButton && Platform.OS === 'web' && onRefresh && (
+          <Pressable
+            onPress={onRefresh}
+            style={[styles.refreshButton, refreshing && styles.refreshButtonDisabled]}
+            disabled={refreshing}
+          >
+            <Text style={styles.refreshButtonText}>{refreshing ? '⟳ Refreshing...' : '⟳ Refresh'}</Text>
+          </Pressable>
         )}
       </View>
     </View>
@@ -837,6 +857,13 @@ function RedditScreenWrapper() {
     setError(null);
 
     try {
+      // Reddit API has CORS restrictions on web
+      if (Platform.OS === 'web') {
+        setError('Reddit integration is only available on the mobile app for now. Stay tuned for updates on this feature in the future!.');
+        setLoading(false);
+        return;
+      }
+
       // Try to load from cache first
       const cached = await AsyncStorage.getItem(REDDIT_CACHE_KEY);
       if (cached) {
@@ -942,6 +969,12 @@ function RedditScreenWrapper() {
   }
 
   async function handleRefresh() {
+    // Disable refresh on web
+    if (Platform.OS === 'web') {
+      setError('Reddit integration is only available on mobile due to browser CORS restrictions.');
+      return;
+    }
+
     // Check if enough time has passed since last fetch
     const lastFetchStr = await AsyncStorage.getItem(REDDIT_LAST_FETCH_KEY);
     if (lastFetchStr) {
@@ -1244,7 +1277,8 @@ function CompanyRow({ index, logoRefreshKey, row, showStock = false, isExpanded 
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
-    if (!showStock || !ticker) {
+    // Disable stock quotes on web due to CORS
+    if (!showStock || !ticker || Platform.OS === 'web') {
       return;
     }
 
@@ -1909,6 +1943,13 @@ const styles = StyleSheet.create({
     borderTopColor: palette.faint,
     paddingTop: 0,
   },
+  topNavigatorBar: {
+    backgroundColor: palette.panel,
+    borderBottomColor: palette.faint,
+    borderBottomWidth: 1,
+    elevation: 0,
+    shadowOpacity: 0,
+  },
   navigatorItem: {
     paddingBottom: 0,
     paddingTop: 2,
@@ -1990,6 +2031,24 @@ const styles = StyleSheet.create({
     color: palette.muted,
     fontSize: 18,
     fontWeight: '700',
+  },
+  refreshButton: {
+    backgroundColor: palette.red,
+    borderRadius: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    minWidth: 120,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  refreshButtonDisabled: {
+    backgroundColor: palette.muted,
+    opacity: 0.6,
+  },
+  refreshButtonText: {
+    color: palette.panel,
+    fontSize: 14,
+    fontWeight: '900',
   },
   logoText: {
     color: palette.panel,
