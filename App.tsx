@@ -1,16 +1,16 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { LinearGradient } from 'expo-linear-gradient';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
+  Pressable,
   SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   View,
 } from 'react-native';
-import Svg, { Circle, G, Line, Path, Rect, Text as SvgText } from 'react-native-svg';
+import Svg, { Circle, G, Line, Path, Text as SvgText } from 'react-native-svg';
 
 declare const process: {
   env: {
@@ -36,11 +36,46 @@ type CachePayload = {
   notices: WarnNotice[];
 };
 
+type ScreenKey = 'overview' | 'companies' | 'regions' | 'notices';
+
+type ChartPoint = {
+  label: string;
+  value: number;
+};
+
+type RankedRow = {
+  label: string;
+  value: number;
+  notices: number;
+  meta?: string;
+};
+
 const WARN_API_KEY = process.env.EXPO_PUBLIC_WARN_FIREHOSE_API_KEY ?? '';
 const WARN_ENDPOINT = 'https://warnfirehose.com/api/records?limit=100';
 const CACHE_KEY = 'warnfirehose.warn_notices.v1';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const FALLBACK_ACCENT = '#ffcf5a';
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+const palette = {
+  page: '#f7f7f5',
+  panel: '#ffffff',
+  ink: '#171717',
+  muted: '#686868',
+  faint: '#e8e5df',
+  soft: '#f0eeea',
+  red: '#e64626',
+  redSoft: '#fff0eb',
+  amber: '#f59f00',
+  blue: '#2563eb',
+  green: '#12805c',
+};
+
+const tabs: { key: ScreenKey; label: string }[] = [
+  { key: 'overview', label: 'Overview' },
+  { key: 'companies', label: 'Companies' },
+  { key: 'regions', label: 'Regions' },
+  { key: 'notices', label: 'Notices' },
+];
 
 const sampleNotices: WarnNotice[] = [
   {
@@ -86,6 +121,7 @@ const sampleNotices: WarnNotice[] = [
 ];
 
 export default function App() {
+  const [activeScreen, setActiveScreen] = useState<ScreenKey>('overview');
   const [notices, setNotices] = useState<WarnNotice[]>([]);
   const [cachedAt, setCachedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -100,11 +136,13 @@ export default function App() {
   async function loadCachedOrFetch() {
     setLoading(true);
     setError(null);
+    let hasCachedData = false;
 
     try {
       const cached = await AsyncStorage.getItem(CACHE_KEY);
       if (cached) {
         const payload = JSON.parse(cached) as CachePayload;
+        hasCachedData = Boolean(payload.notices.length);
         setNotices(payload.notices);
         setCachedAt(payload.savedAt);
 
@@ -116,7 +154,9 @@ export default function App() {
       await fetchAndCache();
     } catch (nextError) {
       setError(getErrorMessage(nextError));
-      setNotices(sampleNotices);
+      if (!hasCachedData) {
+        setNotices(sampleNotices);
+      }
     } finally {
       setLoading(false);
     }
@@ -152,106 +192,167 @@ export default function App() {
   }
 
   return (
-    <LinearGradient colors={['#101820', '#17272a', '#263127']} style={styles.shell}>
-      <StatusBar style="light" />
-      <SafeAreaView style={styles.safeArea}>
-        <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-          <View style={styles.hero}>
-            <View style={styles.brandRow}>
-              <View style={styles.brandMark}>
-                <Text style={styles.brandMarkText}>K</Text>
-              </View>
-              <View>
-                <Text style={styles.kicker}>Klevel.fyi labor telemetry</Text>
-                <Text style={styles.title}>Immigration and layoff signals</Text>
-              </View>
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar style="dark" />
+      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+        <View style={styles.header}>
+          <View style={styles.logoRow}>
+            <View style={styles.logoMark}>
+              <Text style={styles.logoText}>B</Text>
             </View>
-
-            <Text style={styles.heroCopy}>
-              WARN-only feed from Warn Firehose, refreshed automatically when the local cache is 24 hours old.
-            </Text>
-
-            <View style={styles.syncRow}>
-              <View style={styles.syncPill}>
-                <Text style={styles.syncLabel}>Source</Text>
-                <Text style={styles.syncValue}>/api/records</Text>
-              </View>
-              <View style={styles.syncPill}>
-                <Text style={styles.syncLabel}>Cache</Text>
-                <Text style={styles.syncValue}>{cachedAt ? formatDateTime(cachedAt) : 'warming'}</Text>
-              </View>
-              <View style={styles.syncPill}>
-                <Text style={styles.syncLabel}>Refresh</Text>
-                <Text style={styles.syncValue}>24h TTL</Text>
-              </View>
+            <View style={styles.headerCopy}>
+              <Text style={styles.eyebrow}>Blind x layoffs.fyi style</Text>
+              <Text style={styles.title}>WARN layoff intelligence</Text>
             </View>
           </View>
 
-          {loading ? (
-            <View style={styles.loadingPanel}>
-              <ActivityIndicator color={FALLBACK_ACCENT} />
-              <Text style={styles.loadingText}>Pulling WARN notices once, then moving to local cache...</Text>
-            </View>
-          ) : (
-            <>
-              {error ? (
-                <View style={styles.alert}>
-                  <Text style={styles.alertTitle}>Live feed issue</Text>
-                  <Text style={styles.alertText}>{error}</Text>
-                </View>
-              ) : null}
+          <Text style={styles.subtitle}>
+            Minimal telemetry for WARN-only notices, cached locally and refreshed after 24 hours.
+          </Text>
 
-              <View style={styles.metricGrid}>
-                <MetricCard label="WARN notices" value={analytics.totalNotices.toLocaleString()} tone="gold" />
-                <MetricCard label="Workers affected" value={analytics.totalEmployees.toLocaleString()} tone="coral" />
-                <MetricCard label="States touched" value={analytics.stateCount.toLocaleString()} tone="green" />
-                <MetricCard label="Avg impact" value={analytics.averageImpact.toLocaleString()} tone="blue" />
+          <View style={styles.metaRow}>
+            <MetaPill label="Source" value="/api/records" />
+            <MetaPill label="Cache" value={cachedAt ? formatDateTime(cachedAt) : 'warming'} />
+            <MetaPill label="Policy" value="24h TTL" />
+          </View>
+        </View>
+
+        <View style={styles.tabBar}>
+          {tabs.map((tab) => (
+            <Pressable
+              accessibilityRole="button"
+              key={tab.key}
+              onPress={() => setActiveScreen(tab.key)}
+              style={[styles.tabButton, activeScreen === tab.key && styles.tabButtonActive]}
+            >
+              <Text style={[styles.tabText, activeScreen === tab.key && styles.tabTextActive]}>{tab.label}</Text>
+            </Pressable>
+          ))}
+        </View>
+
+        {loading ? (
+          <View style={styles.loadingPanel}>
+            <ActivityIndicator color={palette.red} />
+            <Text style={styles.loadingText}>Loading WARN telemetry...</Text>
+          </View>
+        ) : (
+          <>
+            {error ? (
+              <View style={styles.alert}>
+                <Text style={styles.alertTitle}>Live feed issue</Text>
+                <Text style={styles.alertText}>{error}</Text>
               </View>
+            ) : null}
 
-              <View style={styles.section}>
-                <View style={styles.sectionHeader}>
-                  <View>
-                    <Text style={styles.sectionEyebrow}>Signal density</Text>
-                    <Text style={styles.sectionTitle}>Layoff pulse</Text>
-                  </View>
-                </View>
-                <TrendChart points={analytics.monthlySeries} />
-              </View>
-
-              <View style={styles.splitGrid}>
-                <View style={styles.sectionHalf}>
-                  <Text style={styles.sectionEyebrow}>Geography</Text>
-                  <Text style={styles.sectionTitle}>State exposure</Text>
-                  <BarList rows={analytics.topStates} />
-                </View>
-
-                <View style={styles.sectionHalf}>
-                  <Text style={styles.sectionEyebrow}>Industries</Text>
-                  <Text style={styles.sectionTitle}>Sector stress</Text>
-                  <DonutChart rows={analytics.topIndustries} total={analytics.totalEmployees} />
-                </View>
-              </View>
-
-              <View style={styles.section}>
-                <Text style={styles.sectionEyebrow}>Company tape</Text>
-                <Text style={styles.sectionTitle}>Recent WARN notices</Text>
-                {notices.slice(0, 10).map((notice) => (
-                  <NoticeRow key={notice.id} notice={notice} />
-                ))}
-              </View>
-            </>
-          )}
-        </ScrollView>
-      </SafeAreaView>
-    </LinearGradient>
+            {activeScreen === 'overview' ? <OverviewScreen analytics={analytics} /> : null}
+            {activeScreen === 'companies' ? <CompaniesScreen analytics={analytics} /> : null}
+            {activeScreen === 'regions' ? <RegionsScreen analytics={analytics} /> : null}
+            {activeScreen === 'notices' ? <NoticesScreen notices={analytics.recentNotices} /> : null}
+          </>
+        )}
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
-function MetricCard({ label, value, tone }: { label: string; value: string; tone: 'gold' | 'coral' | 'green' | 'blue' }) {
+function OverviewScreen({ analytics }: { analytics: Analytics }) {
   return (
-    <View style={[styles.metricCard, styles[`metric_${tone}`]]}>
-      <Text style={styles.metricValue}>{value}</Text>
+    <View style={styles.screen}>
+      <View style={styles.metricGrid}>
+        <MetricCard label="Last 7 days" value={analytics.last7.notices.toLocaleString()} detail={`${analytics.last7.employees.toLocaleString()} workers`} accent={palette.red} />
+        <MetricCard label="Last 30 days" value={analytics.last30.notices.toLocaleString()} detail={`${analytics.last30.employees.toLocaleString()} workers`} accent={palette.ink} />
+        <MetricCard label="Companies" value={analytics.companyCount.toLocaleString()} detail="unique employers" accent={palette.blue} />
+        <MetricCard label="Avg impact" value={analytics.averageImpact.toLocaleString()} detail="workers per notice" accent={palette.green} />
+      </View>
+
+      <Section eyebrow="Trend" title="Monthly workers affected">
+        <TrendChart points={analytics.monthlySeries} />
+      </Section>
+
+      <Section eyebrow="Momentum" title="Top companies, last 30 days">
+        <RankList rows={analytics.topCompanies30} emptyLabel="No WARN notices in the last 30 days." />
+      </Section>
+    </View>
+  );
+}
+
+function CompaniesScreen({ analytics }: { analytics: Analytics }) {
+  return (
+    <View style={styles.screen}>
+      <Section eyebrow="Hot list" title="Top companies, last 7 days">
+        <RankList rows={analytics.topCompanies7} emptyLabel="No WARN notices in the last 7 days." />
+      </Section>
+
+      <Section eyebrow="Thirty-day view" title="Top companies, last 30 days">
+        <RankList rows={analytics.topCompanies30} emptyLabel="No WARN notices in the last 30 days." />
+      </Section>
+
+      <Section eyebrow="All cached notices" title="Largest total impact">
+        <RankList rows={analytics.topCompaniesAll} emptyLabel="No company telemetry available." />
+      </Section>
+    </View>
+  );
+}
+
+function RegionsScreen({ analytics }: { analytics: Analytics }) {
+  return (
+    <View style={styles.screen}>
+      <View style={styles.metricGrid}>
+        <MetricCard label="States" value={analytics.stateCount.toLocaleString()} detail="with cached WARNs" accent={palette.red} />
+        <MetricCard label="Industries" value={analytics.industryCount.toLocaleString()} detail="represented" accent={palette.ink} />
+      </View>
+
+      <Section eyebrow="Geography" title="State exposure">
+        <BarList rows={analytics.topStates} />
+      </Section>
+
+      <Section eyebrow="Sectors" title="Industry stress">
+        <BarList rows={analytics.topIndustries} />
+      </Section>
+    </View>
+  );
+}
+
+function NoticesScreen({ notices }: { notices: WarnNotice[] }) {
+  return (
+    <View style={styles.screen}>
+      <Section eyebrow="Company tape" title="Recent WARN notices">
+        {notices.map((notice) => (
+          <NoticeRow key={notice.id} notice={notice} />
+        ))}
+      </Section>
+    </View>
+  );
+}
+
+function MetaPill({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.metaPill}>
+      <Text style={styles.metaLabel}>{label}</Text>
+      <Text style={styles.metaValue} numberOfLines={1}>
+        {value}
+      </Text>
+    </View>
+  );
+}
+
+function Section({ children, eyebrow, title }: { children: React.ReactNode; eyebrow: string; title: string }) {
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionEyebrow}>{eyebrow}</Text>
+      <Text style={styles.sectionTitle}>{title}</Text>
+      <View style={styles.sectionBody}>{children}</View>
+    </View>
+  );
+}
+
+function MetricCard({ accent, detail, label, value }: { accent: string; detail: string; label: string; value: string }) {
+  return (
+    <View style={styles.metricCard}>
+      <View style={[styles.metricAccent, { backgroundColor: accent }]} />
       <Text style={styles.metricLabel}>{label}</Text>
+      <Text style={styles.metricValue}>{value}</Text>
+      <Text style={styles.metricDetail}>{detail}</Text>
     </View>
   );
 }
@@ -280,21 +381,57 @@ function TrendChart({ points }: { points: ChartPoint[] }) {
             x2={width - padding}
             y1={padding + tick * 48}
             y2={padding + tick * 48}
-            stroke="rgba(255,255,255,0.11)"
+            stroke={palette.faint}
             strokeWidth={1}
           />
         ))}
-        <Path d={area} fill="rgba(255, 207, 90, 0.16)" />
-        <Path d={line} fill="none" stroke={FALLBACK_ACCENT} strokeLinecap="round" strokeWidth={4} />
+        <Path d={area} fill={palette.redSoft} />
+        <Path d={line} fill="none" stroke={palette.red} strokeLinecap="round" strokeWidth={3} />
         {coords.map((point) => (
           <G key={point.label}>
-            <Circle cx={point.x} cy={point.y} r={5} fill="#101820" stroke={FALLBACK_ACCENT} strokeWidth={3} />
-            <SvgText x={point.x} y={height - 4} fill="rgba(255,255,255,0.58)" fontSize={10} textAnchor="middle">
+            <Circle cx={point.x} cy={point.y} r={4} fill={palette.panel} stroke={palette.red} strokeWidth={2} />
+            <SvgText x={point.x} y={height - 4} fill={palette.muted} fontSize={10} textAnchor="middle">
               {point.label}
             </SvgText>
           </G>
         ))}
       </Svg>
+    </View>
+  );
+}
+
+function RankList({ emptyLabel, rows }: { emptyLabel: string; rows: RankedRow[] }) {
+  if (!rows.length) {
+    return <Text style={styles.emptyText}>{emptyLabel}</Text>;
+  }
+
+  return (
+    <View style={styles.rankList}>
+      {rows.map((row, index) => (
+        <CompanyRow key={`${row.label}-${index}`} index={index} row={row} />
+      ))}
+    </View>
+  );
+}
+
+function CompanyRow({ index, row }: { index: number; row: RankedRow }) {
+  return (
+    <View style={styles.companyRow}>
+      <View style={styles.rankBadge}>
+        <Text style={styles.rankBadgeText}>{index + 1}</Text>
+      </View>
+      <View style={styles.companyMain}>
+        <Text style={styles.companyName} numberOfLines={1}>
+          {row.label}
+        </Text>
+        <Text style={styles.companyMeta} numberOfLines={1}>
+          {row.notices.toLocaleString()} notices{row.meta ? ` / ${row.meta}` : ''}
+        </Text>
+      </View>
+      <View style={styles.companyImpact}>
+        <Text style={styles.companyWorkers}>{row.value.toLocaleString()}</Text>
+        <Text style={styles.companyWorkersLabel}>workers</Text>
+      </View>
     </View>
   );
 }
@@ -311,7 +448,15 @@ function BarList({ rows }: { rows: RankedRow[] }) {
             <Text style={styles.barValue}>{row.value.toLocaleString()}</Text>
           </View>
           <View style={styles.barTrack}>
-            <View style={[styles.barFill, { width: `${Math.max((row.value / max) * 100, 6)}%`, opacity: 1 - index * 0.09 }]} />
+            <View
+              style={[
+                styles.barFill,
+                {
+                  backgroundColor: index === 0 ? palette.red : palette.ink,
+                  width: `${Math.max((row.value / max) * 100, 5)}%`,
+                },
+              ]}
+            />
           </View>
         </View>
       ))}
@@ -319,63 +464,13 @@ function BarList({ rows }: { rows: RankedRow[] }) {
   );
 }
 
-function DonutChart({ rows, total }: { rows: RankedRow[]; total: number }) {
-  const size = 180;
-  const strokeWidth = 22;
-  const radius = 62;
-  const circumference = 2 * Math.PI * radius;
-  let offset = 0;
-  const palette = ['#ffcf5a', '#ff7a61', '#79d99b', '#72b7ff', '#d5e7a2'];
-
-  return (
-    <View style={styles.donutWrap}>
-      <Svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
-        <Circle cx={size / 2} cy={size / 2} r={radius} stroke="rgba(255,255,255,0.1)" strokeWidth={strokeWidth} fill="none" />
-        {rows.map((row, index) => {
-          const segment = total > 0 ? (row.value / total) * circumference : 0;
-          const dashOffset = -offset;
-          offset += segment;
-          return (
-            <Circle
-              key={row.label}
-              cx={size / 2}
-              cy={size / 2}
-              r={radius}
-              stroke={palette[index % palette.length]}
-              strokeWidth={strokeWidth}
-              fill="none"
-              strokeDasharray={`${segment} ${circumference - segment}`}
-              strokeDashoffset={dashOffset}
-              strokeLinecap="round"
-              rotation="-90"
-              origin={`${size / 2}, ${size / 2}`}
-            />
-          );
-        })}
-        <SvgText x={size / 2} y={size / 2 - 2} fill="#ffffff" fontSize={28} fontWeight="700" textAnchor="middle">
-          {rows.length}
-        </SvgText>
-        <SvgText x={size / 2} y={size / 2 + 22} fill="rgba(255,255,255,0.62)" fontSize={11} textAnchor="middle">
-          sectors
-        </SvgText>
-      </Svg>
-      <View style={styles.legend}>
-        {rows.map((row, index) => (
-          <View key={row.label} style={styles.legendRow}>
-            <View style={[styles.legendDot, { backgroundColor: palette[index % palette.length] }]} />
-            <Text style={styles.legendText} numberOfLines={1}>
-              {row.label}
-            </Text>
-          </View>
-        ))}
-      </View>
-    </View>
-  );
-}
-
 function NoticeRow({ notice }: { notice: WarnNotice }) {
   return (
     <View style={styles.noticeRow}>
+      <View style={styles.noticeDateBlock}>
+        <Text style={styles.noticeMonth}>{formatMonth(notice.date)}</Text>
+        <Text style={styles.noticeDay}>{formatDay(notice.date)}</Text>
+      </View>
       <View style={styles.noticeMain}>
         <Text style={styles.noticeCompany} numberOfLines={1}>
           {notice.company}
@@ -386,36 +481,47 @@ function NoticeRow({ notice }: { notice: WarnNotice }) {
       </View>
       <View style={styles.noticeImpact}>
         <Text style={styles.noticeEmployees}>{notice.employees.toLocaleString()}</Text>
-        <Text style={styles.noticeDate}>{formatShortDate(notice.date)}</Text>
+        <Text style={styles.noticeEmployeesLabel}>workers</Text>
       </View>
     </View>
   );
 }
 
-type ChartPoint = {
-  label: string;
-  value: number;
-};
-
-type RankedRow = {
-  label: string;
-  value: number;
-};
+type Analytics = ReturnType<typeof buildAnalytics>;
 
 function buildAnalytics(notices: WarnNotice[]) {
+  const sorted = [...notices].sort((a, b) => toTime(b.date) - toTime(a.date));
   const totalEmployees = notices.reduce((sum, notice) => sum + notice.employees, 0);
+  const last7Notices = filterWithinDays(notices, 7);
+  const last30Notices = filterWithinDays(notices, 30);
   const states = groupBy(notices, (notice) => notice.state || 'NA');
   const industries = groupBy(notices, (notice) => notice.industry || 'Unclassified');
+  const companies = groupBy(notices, (notice) => notice.company || 'Unknown company');
   const months = groupBy(notices, (notice) => monthKey(notice.date));
 
   return {
     totalNotices: notices.length,
     totalEmployees,
+    companyCount: Object.keys(companies).length,
+    industryCount: Object.keys(industries).length,
     stateCount: Object.keys(states).length,
     averageImpact: notices.length ? Math.round(totalEmployees / notices.length) : 0,
-    topStates: rankGroups(states).slice(0, 5),
-    topIndustries: rankGroups(industries).slice(0, 5),
+    last7: summarize(last7Notices),
+    last30: summarize(last30Notices),
+    topCompanies7: rankGroups(groupBy(last7Notices, (notice) => notice.company)).slice(0, 8),
+    topCompanies30: rankGroups(groupBy(last30Notices, (notice) => notice.company)).slice(0, 8),
+    topCompaniesAll: rankGroups(companies).slice(0, 12),
+    topStates: rankGroups(states).slice(0, 8),
+    topIndustries: rankGroups(industries).slice(0, 8),
     monthlySeries: buildMonthlySeries(months),
+    recentNotices: sorted.slice(0, 25),
+  };
+}
+
+function summarize(records: WarnNotice[]) {
+  return {
+    notices: records.length,
+    employees: records.reduce((sum, notice) => sum + notice.employees, 0),
   };
 }
 
@@ -424,6 +530,8 @@ function rankGroups(groups: Record<string, WarnNotice[]>): RankedRow[] {
     .map(([label, group]) => ({
       label,
       value: group.reduce((sum, notice) => sum + notice.employees, 0),
+      notices: group.length,
+      meta: compactUnique(group.map((notice) => notice.state)).slice(0, 3).join(', '),
     }))
     .sort((a, b) => b.value - a.value);
 }
@@ -438,12 +546,21 @@ function buildMonthlySeries(groups: Record<string, WarnNotice[]>): ChartPoint[] 
   return series.length > 1 ? series : [{ label: 'now', value: series[0]?.value ?? 1 }, { label: 'next', value: series[0]?.value ?? 1 }];
 }
 
+function filterWithinDays(records: WarnNotice[], days: number) {
+  const cutoff = Date.now() - days * DAY_MS;
+  return records.filter((notice) => toTime(notice.date) >= cutoff);
+}
+
 function groupBy(records: WarnNotice[], getKey: (notice: WarnNotice) => string) {
   return records.reduce<Record<string, WarnNotice[]>>((groups, notice) => {
     const key = getKey(notice).trim() || 'Unknown';
     groups[key] = [...(groups[key] ?? []), notice];
     return groups;
   }, {});
+}
+
+function compactUnique(values: string[]) {
+  return Array.from(new Set(values.filter(Boolean)));
 }
 
 function extractRecords(json: unknown): RawWarnRecord[] {
@@ -495,6 +612,11 @@ function number(...values: unknown[]) {
   return value === undefined || value === null ? 0 : Number(value);
 }
 
+function toTime(date: string) {
+  const parsed = new Date(date).getTime();
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
 function monthKey(date: string) {
   const parsed = new Date(date);
   if (Number.isNaN(parsed.getTime())) {
@@ -518,13 +640,14 @@ function formatDateTime(date: string) {
   }).format(new Date(date));
 }
 
-function formatShortDate(date: string) {
+function formatMonth(date: string) {
   const parsed = new Date(date);
-  if (Number.isNaN(parsed.getTime())) {
-    return 'date n/a';
-  }
+  return Number.isNaN(parsed.getTime()) ? 'NA' : new Intl.DateTimeFormat('en-US', { month: 'short' }).format(parsed);
+}
 
-  return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(parsed);
+function formatDay(date: string) {
+  const parsed = new Date(date);
+  return Number.isNaN(parsed.getTime()) ? '--' : new Intl.DateTimeFormat('en-US', { day: '2-digit' }).format(parsed);
 }
 
 function getErrorMessage(error: unknown) {
@@ -532,113 +655,143 @@ function getErrorMessage(error: unknown) {
 }
 
 const styles = StyleSheet.create({
-  shell: {
-    flex: 1,
-  },
   safeArea: {
+    backgroundColor: palette.page,
     flex: 1,
   },
   content: {
-    gap: 18,
+    gap: 16,
     padding: 18,
     paddingBottom: 36,
   },
-  hero: {
-    gap: 18,
-    minHeight: 248,
-    justifyContent: 'flex-end',
-    paddingTop: 24,
+  header: {
+    gap: 16,
+    paddingTop: 12,
   },
-  brandRow: {
+  logoRow: {
     alignItems: 'center',
     flexDirection: 'row',
-    gap: 14,
+    gap: 12,
   },
-  brandMark: {
+  logoMark: {
     alignItems: 'center',
-    backgroundColor: FALLBACK_ACCENT,
+    backgroundColor: palette.ink,
     borderRadius: 8,
-    height: 48,
+    height: 44,
     justifyContent: 'center',
-    width: 48,
+    width: 44,
   },
-  brandMarkText: {
-    color: '#101820',
-    fontSize: 26,
+  logoText: {
+    color: palette.panel,
+    fontSize: 24,
     fontWeight: '900',
   },
-  kicker: {
-    color: '#a9d8c6',
-    fontSize: 12,
-    fontWeight: '700',
+  headerCopy: {
+    flex: 1,
+  },
+  eyebrow: {
+    color: palette.red,
+    fontSize: 11,
+    fontWeight: '800',
     letterSpacing: 0,
     textTransform: 'uppercase',
   },
   title: {
-    color: '#ffffff',
-    fontSize: 36,
-    fontWeight: '800',
-    lineHeight: 40,
-    maxWidth: 320,
+    color: palette.ink,
+    fontSize: 32,
+    fontWeight: '900',
+    lineHeight: 36,
+    marginTop: 3,
   },
-  heroCopy: {
-    color: 'rgba(255,255,255,0.74)',
-    fontSize: 16,
-    lineHeight: 24,
-    maxWidth: 340,
+  subtitle: {
+    color: palette.muted,
+    fontSize: 15,
+    lineHeight: 22,
+    maxWidth: 420,
   },
-  syncRow: {
+  metaRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 10,
+    gap: 8,
   },
-  syncPill: {
-    backgroundColor: 'rgba(255,255,255,0.08)',
-    borderColor: 'rgba(255,255,255,0.12)',
+  metaPill: {
+    backgroundColor: palette.panel,
+    borderColor: palette.faint,
     borderRadius: 8,
     borderWidth: 1,
-    minWidth: 142,
+    minWidth: 112,
     paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingVertical: 9,
   },
-  syncLabel: {
-    color: 'rgba(255,255,255,0.52)',
-    fontSize: 11,
-    fontWeight: '700',
+  metaLabel: {
+    color: palette.muted,
+    fontSize: 10,
+    fontWeight: '800',
     textTransform: 'uppercase',
   },
-  syncValue: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '700',
-    marginTop: 4,
+  metaValue: {
+    color: palette.ink,
+    fontSize: 13,
+    fontWeight: '800',
+    marginTop: 3,
+  },
+  tabBar: {
+    backgroundColor: palette.soft,
+    borderColor: palette.faint,
+    borderRadius: 8,
+    borderWidth: 1,
+    flexDirection: 'row',
+    padding: 3,
+  },
+  tabButton: {
+    alignItems: 'center',
+    borderRadius: 6,
+    flex: 1,
+    minHeight: 38,
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+  },
+  tabButtonActive: {
+    backgroundColor: palette.panel,
+  },
+  tabText: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  tabTextActive: {
+    color: palette.ink,
+  },
+  screen: {
+    gap: 16,
   },
   loadingPanel: {
     alignItems: 'center',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: palette.panel,
+    borderColor: palette.faint,
     borderRadius: 8,
+    borderWidth: 1,
     gap: 12,
-    padding: 24,
+    padding: 28,
   },
   loadingText: {
-    color: 'rgba(255,255,255,0.72)',
+    color: palette.muted,
     fontSize: 14,
-    textAlign: 'center',
   },
   alert: {
-    backgroundColor: 'rgba(255,122,97,0.14)',
-    borderColor: 'rgba(255,122,97,0.36)',
+    backgroundColor: palette.redSoft,
+    borderColor: '#ffd1c5',
     borderRadius: 8,
     borderWidth: 1,
     padding: 14,
   },
   alertTitle: {
-    color: '#ffb4a6',
+    color: palette.red,
     fontSize: 14,
-    fontWeight: '800',
+    fontWeight: '900',
   },
   alertText: {
-    color: 'rgba(255,255,255,0.76)',
+    color: palette.ink,
     fontSize: 13,
     lineHeight: 19,
     marginTop: 4,
@@ -649,148 +802,188 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   metricCard: {
+    backgroundColor: palette.panel,
+    borderColor: palette.faint,
     borderRadius: 8,
-    minHeight: 106,
+    borderWidth: 1,
+    minHeight: 116,
     padding: 14,
     width: '48%',
   },
-  metric_gold: {
-    backgroundColor: 'rgba(255,207,90,0.16)',
-  },
-  metric_coral: {
-    backgroundColor: 'rgba(255,122,97,0.16)',
-  },
-  metric_green: {
-    backgroundColor: 'rgba(121,217,155,0.15)',
-  },
-  metric_blue: {
-    backgroundColor: 'rgba(114,183,255,0.15)',
-  },
-  metricValue: {
-    color: '#ffffff',
-    fontSize: 28,
-    fontWeight: '900',
+  metricAccent: {
+    borderRadius: 2,
+    height: 4,
+    marginBottom: 14,
+    width: 36,
   },
   metricLabel: {
-    color: 'rgba(255,255,255,0.62)',
-    fontSize: 12,
-    fontWeight: '700',
-    marginTop: 8,
-    textTransform: 'uppercase',
-  },
-  section: {
-    backgroundColor: 'rgba(255,255,255,0.075)',
-    borderColor: 'rgba(255,255,255,0.11)',
-    borderRadius: 8,
-    borderWidth: 1,
-    padding: 16,
-  },
-  sectionHalf: {
-    backgroundColor: 'rgba(255,255,255,0.075)',
-    borderColor: 'rgba(255,255,255,0.11)',
-    borderRadius: 8,
-    borderWidth: 1,
-    gap: 12,
-    padding: 16,
-  },
-  sectionHeader: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-  },
-  sectionEyebrow: {
-    color: '#a9d8c6',
+    color: palette.muted,
     fontSize: 11,
     fontWeight: '800',
     textTransform: 'uppercase',
   },
+  metricValue: {
+    color: palette.ink,
+    fontSize: 30,
+    fontWeight: '900',
+    marginTop: 6,
+  },
+  metricDetail: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 5,
+  },
+  section: {
+    backgroundColor: palette.panel,
+    borderColor: palette.faint,
+    borderRadius: 8,
+    borderWidth: 1,
+    padding: 16,
+  },
+  sectionEyebrow: {
+    color: palette.red,
+    fontSize: 11,
+    fontWeight: '900',
+    textTransform: 'uppercase',
+  },
   sectionTitle: {
-    color: '#ffffff',
-    fontSize: 21,
-    fontWeight: '800',
+    color: palette.ink,
+    fontSize: 20,
+    fontWeight: '900',
     marginTop: 3,
   },
-  chartFrame: {
+  sectionBody: {
     marginTop: 14,
   },
-  splitGrid: {
-    gap: 18,
+  chartFrame: {
+    marginTop: 2,
+  },
+  rankList: {
+    gap: 0,
+  },
+  companyRow: {
+    alignItems: 'center',
+    borderBottomColor: palette.faint,
+    borderBottomWidth: 1,
+    flexDirection: 'row',
+    gap: 12,
+    paddingVertical: 12,
+  },
+  rankBadge: {
+    alignItems: 'center',
+    backgroundColor: palette.soft,
+    borderRadius: 8,
+    height: 32,
+    justifyContent: 'center',
+    width: 32,
+  },
+  rankBadgeText: {
+    color: palette.ink,
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  companyMain: {
+    flex: 1,
+  },
+  companyName: {
+    color: palette.ink,
+    fontSize: 15,
+    fontWeight: '900',
+  },
+  companyMeta: {
+    color: palette.muted,
+    fontSize: 12,
+    marginTop: 4,
+  },
+  companyImpact: {
+    alignItems: 'flex-end',
+  },
+  companyWorkers: {
+    color: palette.red,
+    fontSize: 16,
+    fontWeight: '900',
+  },
+  companyWorkersLabel: {
+    color: palette.muted,
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  emptyText: {
+    color: palette.muted,
+    fontSize: 14,
+    lineHeight: 20,
   },
   barList: {
     gap: 14,
-    marginTop: 4,
   },
   barRow: {
     gap: 8,
   },
   barLabelRow: {
     flexDirection: 'row',
+    gap: 12,
     justifyContent: 'space-between',
   },
   barLabel: {
-    color: '#ffffff',
+    color: palette.ink,
     flex: 1,
     fontSize: 14,
-    fontWeight: '700',
+    fontWeight: '900',
   },
   barValue: {
-    color: 'rgba(255,255,255,0.64)',
+    color: palette.muted,
     fontSize: 13,
-    fontWeight: '700',
+    fontWeight: '800',
   },
   barTrack: {
-    backgroundColor: 'rgba(255,255,255,0.1)',
+    backgroundColor: palette.soft,
     borderRadius: 8,
     height: 8,
     overflow: 'hidden',
   },
   barFill: {
-    backgroundColor: FALLBACK_ACCENT,
     borderRadius: 8,
     height: 8,
   },
-  donutWrap: {
-    alignItems: 'center',
-    gap: 6,
-  },
-  legend: {
-    alignSelf: 'stretch',
-    gap: 8,
-  },
-  legendRow: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    gap: 8,
-  },
-  legendDot: {
-    borderRadius: 5,
-    height: 10,
-    width: 10,
-  },
-  legendText: {
-    color: 'rgba(255,255,255,0.74)',
-    flex: 1,
-    fontSize: 13,
-    fontWeight: '700',
-  },
   noticeRow: {
     alignItems: 'center',
-    borderBottomColor: 'rgba(255,255,255,0.09)',
+    borderBottomColor: palette.faint,
     borderBottomWidth: 1,
     flexDirection: 'row',
     gap: 12,
-    paddingVertical: 14,
+    paddingVertical: 13,
+  },
+  noticeDateBlock: {
+    alignItems: 'center',
+    backgroundColor: palette.soft,
+    borderRadius: 8,
+    minHeight: 46,
+    justifyContent: 'center',
+    width: 48,
+  },
+  noticeMonth: {
+    color: palette.muted,
+    fontSize: 10,
+    fontWeight: '900',
+    textTransform: 'uppercase',
+  },
+  noticeDay: {
+    color: palette.ink,
+    fontSize: 17,
+    fontWeight: '900',
   },
   noticeMain: {
     flex: 1,
   },
   noticeCompany: {
-    color: '#ffffff',
+    color: palette.ink,
     fontSize: 15,
-    fontWeight: '800',
+    fontWeight: '900',
   },
   noticeMeta: {
-    color: 'rgba(255,255,255,0.55)',
+    color: palette.muted,
     fontSize: 12,
     marginTop: 4,
   },
@@ -798,13 +991,14 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
   },
   noticeEmployees: {
-    color: FALLBACK_ACCENT,
+    color: palette.red,
     fontSize: 16,
     fontWeight: '900',
   },
-  noticeDate: {
-    color: 'rgba(255,255,255,0.52)',
-    fontSize: 12,
-    marginTop: 4,
+  noticeEmployeesLabel: {
+    color: palette.muted,
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 2,
   },
 });
