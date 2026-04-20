@@ -1,6 +1,6 @@
 # Klevel WARN Telemetry
 
-React Native Expo app for a klevel.fyi-style labor dashboard. It calls the WARN Firehose WARN notices endpoint once, stores the result in AsyncStorage, and renders cached telemetry on later launches.
+React Native Expo app for a klevel.fyi-style labor dashboard. It calls the WARN Firehose WARN notices endpoint, stores the result in AsyncStorage, and renders cached telemetry on later launches until the cache is 24 hours old.
 
 ## Commands
 
@@ -37,4 +37,4 @@ AsyncStorage key:
 warnfirehose.warn_notices.v1
 ```
 
-Use the in-app Refresh button to clear and refetch the cache.
+Cached records are reused for 24 hours. Once the cache is older than 24 hours, the app automatically refetches and stores fresh WARN notices on launch.

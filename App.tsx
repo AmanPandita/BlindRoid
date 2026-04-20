@@ -4,7 +4,6 @@ import { StatusBar } from 'expo-status-bar';
 import { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
-  Pressable,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -40,6 +39,7 @@ type CachePayload = {
 const WARN_API_KEY = process.env.EXPO_PUBLIC_WARN_FIREHOSE_API_KEY ?? '';
 const WARN_ENDPOINT = 'https://warnfirehose.com/api/records?limit=100';
 const CACHE_KEY = 'warnfirehose.warn_notices.v1';
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const FALLBACK_ACCENT = '#ffcf5a';
 
 const sampleNotices: WarnNotice[] = [
@@ -89,7 +89,6 @@ export default function App() {
   const [notices, setNotices] = useState<WarnNotice[]>([]);
   const [cachedAt, setCachedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -108,7 +107,10 @@ export default function App() {
         const payload = JSON.parse(cached) as CachePayload;
         setNotices(payload.notices);
         setCachedAt(payload.savedAt);
-        return;
+
+        if (!isCacheExpired(payload.savedAt)) {
+          return;
+        }
       }
 
       await fetchAndCache();
@@ -149,21 +151,6 @@ export default function App() {
     setCachedAt(savedAt);
   }
 
-  async function refreshCache() {
-    setRefreshing(true);
-    setError(null);
-
-    try {
-      await AsyncStorage.removeItem(CACHE_KEY);
-      await fetchAndCache();
-    } catch (nextError) {
-      setError(getErrorMessage(nextError));
-    } finally {
-      setRefreshing(false);
-      setLoading(false);
-    }
-  }
-
   return (
     <LinearGradient colors={['#101820', '#17272a', '#263127']} style={styles.shell}>
       <StatusBar style="light" />
@@ -181,7 +168,7 @@ export default function App() {
             </View>
 
             <Text style={styles.heroCopy}>
-              WARN-only feed from Warn Firehose, cached locally after the first successful pull.
+              WARN-only feed from Warn Firehose, refreshed automatically when the local cache is 24 hours old.
             </Text>
 
             <View style={styles.syncRow}>
@@ -192,6 +179,10 @@ export default function App() {
               <View style={styles.syncPill}>
                 <Text style={styles.syncLabel}>Cache</Text>
                 <Text style={styles.syncValue}>{cachedAt ? formatDateTime(cachedAt) : 'warming'}</Text>
+              </View>
+              <View style={styles.syncPill}>
+                <Text style={styles.syncLabel}>Refresh</Text>
+                <Text style={styles.syncValue}>24h TTL</Text>
               </View>
             </View>
           </View>
@@ -223,14 +214,6 @@ export default function App() {
                     <Text style={styles.sectionEyebrow}>Signal density</Text>
                     <Text style={styles.sectionTitle}>Layoff pulse</Text>
                   </View>
-                  <Pressable
-                    accessibilityRole="button"
-                    disabled={refreshing}
-                    onPress={refreshCache}
-                    style={({ pressed }) => [styles.refreshButton, pressed && styles.pressedButton]}
-                  >
-                    <Text style={styles.refreshButtonText}>{refreshing ? 'Syncing' : 'Refresh'}</Text>
-                  </Pressable>
                 </View>
                 <TrendChart points={analytics.monthlySeries} />
               </View>
@@ -521,6 +504,11 @@ function monthKey(date: string) {
   return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, '0')}`;
 }
 
+function isCacheExpired(savedAt: string) {
+  const savedTime = new Date(savedAt).getTime();
+  return Number.isNaN(savedTime) || Date.now() - savedTime >= CACHE_TTL_MS;
+}
+
 function formatDateTime(date: string) {
   return new Intl.DateTimeFormat('en-US', {
     month: 'short',
@@ -721,22 +709,6 @@ const styles = StyleSheet.create({
     fontSize: 21,
     fontWeight: '800',
     marginTop: 3,
-  },
-  refreshButton: {
-    alignItems: 'center',
-    backgroundColor: '#ffffff',
-    borderRadius: 8,
-    minWidth: 86,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-  },
-  pressedButton: {
-    opacity: 0.76,
-  },
-  refreshButtonText: {
-    color: '#101820',
-    fontSize: 13,
-    fontWeight: '900',
   },
   chartFrame: {
     marginTop: 14,
