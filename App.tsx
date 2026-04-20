@@ -6,6 +6,7 @@ import { ReactNode, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
+  Linking,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -20,6 +21,8 @@ import Svg, { Circle, Path } from 'react-native-svg';
 declare const process: {
   env: {
     EXPO_PUBLIC_WARN_FIREHOSE_API_KEY?: string;
+    EXPO_PUBLIC_REDDIT_CLIENT_ID?: string;
+    EXPO_PUBLIC_REDDIT_CLIENT_SECRET?: string;
   };
 };
 
@@ -47,6 +50,7 @@ type RootTabParamList = {
   Companies: undefined;
   Regions: undefined;
   Notices: undefined;
+  Reddit: undefined;
 };
 
 type RankedRow = {
@@ -67,14 +71,31 @@ type StockQuote = {
   symbol: string;
 };
 
+type RedditPost = {
+  id: string;
+  title: string;
+  author: string;
+  created: number;
+  url: string;
+  permalink: string;
+  selftext: string;
+  subreddit: string;
+  score: number;
+  num_comments: number;
+  company?: string;
+};
+
 const WARN_API_KEY = process.env.EXPO_PUBLIC_WARN_FIREHOSE_API_KEY;
 const WARN_BASE_ENDPOINT = 'https://warnfirehose.com/api/records';
 const PAGE_LIMIT = 25;
 const MAX_API_CALLS = 20;
 const CACHE_KEY = 'warnfirehose.warn_notices.v1';
+const REDDIT_CACHE_KEY = 'warnfirehose.reddit_posts.v1';
+const REDDIT_LAST_FETCH_KEY = 'warnfirehose.reddit_last_fetch.v1';
 const CACHE_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const CACHE_REFRESH_CHECK_MS = 60 * 1000; // Check every minute
 const CACHE_REFRESH_HOUR = 7; // 7 AM
+const REDDIT_REFRESH_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes cooldown between refreshes
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 const palette = {
@@ -420,6 +441,9 @@ function AppTabs({
       <Tab.Screen name="Notices">
         {() => <NoticesScreenWrapper error={error} loading={loading} notices={notices} />}
       </Tab.Screen>
+      <Tab.Screen name="Reddit">
+        {() => <RedditScreenWrapper />}
+      </Tab.Screen>
     </Tab.Navigator>
   );
 }
@@ -446,8 +470,7 @@ function ScreenShell({ children, error, loading, onRefresh, refreshing, searchVa
         <Header searchValue={searchValue} onSearchChange={onSearchChange} searchPlaceholder={searchPlaceholder} />
         {loading ? (
           <View style={styles.loadingPanel}>
-            <ActivityIndicator color={palette.red} />
-            <Text style={styles.loadingText}>Loading WARN telemetry...</Text>
+            <ActivityIndicator color={palette.red} size="large" />
           </View>
         ) : (
           <>
@@ -529,6 +552,15 @@ function tabIcon(name: keyof RootTabParamList, color: string) {
         <>
           <Path d="M7 4h8l3 3v13H7z" fill="none" stroke={color} strokeLinejoin="round" strokeWidth={2.1} />
           <Path d="M14 4v4h4M10 12h5M10 16h5" stroke={color} strokeLinecap="round" strokeWidth={2.1} />
+        </>
+      );
+    case 'Reddit':
+      return (
+        <>
+          <Circle cx={12} cy={12} r={10} fill="none" stroke={color} strokeWidth={2.1} />
+          <Circle cx={9} cy={10} r={1.5} fill={color} />
+          <Circle cx={15} cy={10} r={1.5} fill={color} />
+          <Path d="M8 15c0 0 1.5 2 4 2s4-2 4-2" fill="none" stroke={color} strokeLinecap="round" strokeWidth={2.1} />
         </>
       );
   }
@@ -665,7 +697,7 @@ function CompaniesScreenWrapper({ analytics, error, loading }: { analytics: Anal
 }
 
 function CompaniesScreen({ analytics, companyQuery, logoRefreshKey }: { analytics: Analytics; companyQuery: string; logoRefreshKey: number }) {
-  const [range, setRange] = useState<CompanyRangeKey>('all');
+  const [range, setRange] = useState<CompanyRangeKey>('30d');
   const rows = filterRankedRows(getCompanyRowsForRange(analytics, range), companyQuery);
 
   return (
@@ -750,7 +782,7 @@ function NoticesScreenWrapper({ error, loading, notices }: { error: string | nul
 }
 
 function NoticesScreen({ logoRefreshKey, notices, noticeQuery }: { logoRefreshKey: number; notices: WarnNotice[]; noticeQuery: string }) {
-  const [range, setRange] = useState<NoticeRangeKey>('7d');
+  const [range, setRange] = useState<NoticeRangeKey>('30d');
   const [expandedNotice, setExpandedNotice] = useState<string | null>(null);
   const visibleNotices = filterNotices(getNoticesForRange(notices, range), noticeQuery);
 
@@ -775,6 +807,315 @@ function NoticesScreen({ logoRefreshKey, notices, noticeQuery }: { logoRefreshKe
       </Section>
     </View>
   );
+}
+
+function RedditScreenWrapper() {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [posts, setPosts] = useState<RedditPost[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [refreshing, setRefreshing] = useState(false);
+
+  useEffect(() => {
+    loadCachedOrFetchReddit();
+  }, []);
+
+  async function loadCachedOrFetchReddit() {
+    setLoading(true);
+    setError(null);
+
+    try {
+      // Try to load from cache first
+      const cached = await AsyncStorage.getItem(REDDIT_CACHE_KEY);
+      if (cached) {
+        const cachedPosts = JSON.parse(cached) as RedditPost[];
+        setPosts(cachedPosts);
+        setLoading(false);
+        return;
+      }
+
+      // No cache, fetch from API
+      await fetchRedditPosts();
+    } catch (err) {
+      setError(getErrorMessage(err));
+      setLoading(false);
+    }
+  }
+
+  async function fetchRedditPosts() {
+    try {
+      // Target specific subreddits with all relevant keywords
+      // Reddit public API max limit is 100 per request, but we'll use smaller batches for reliability
+      const subreddits = ['layoffs', 'cscareerquestions', 'h1b', 'immigration', 'jobs', 'tech'];
+      const searchQuery = 'WARN OR "WARN notice" OR layoff OR layoffs OR "laid off" OR severance';
+
+      const searches: Array<{ subreddit: string; query: string; limit: number }> = subreddits.map(sub => ({
+        subreddit: sub,
+        query: searchQuery,
+        limit: 100, // Max out the Reddit API limit per request
+      }));
+
+      const allPosts: RedditPost[] = [];
+      const keywords = ['warn', 'warn notice', 'layoff', 'layoffs', 'laid off', 'tech layoff', 'severance'];
+
+      for (const { subreddit, query, limit } of searches) {
+        try {
+          // Add delay between requests to avoid rate limiting (2 seconds for safety)
+          if (allPosts.length > 0) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+
+          const url = `https://www.reddit.com/r/${subreddit}/search.json?q=${encodeURIComponent(query)}&restrict_sr=1&sort=new&limit=${limit}&t=month`;
+
+          const response = await fetch(url, {
+            headers: {
+              'User-Agent': 'bWARNed/1.0',
+            },
+          });
+
+          if (!response.ok) {
+            console.error(`Reddit returned ${response.status} for r/${subreddit}`);
+            continue;
+          }
+
+          const data = await response.json();
+          const posts = data.data?.children || [];
+
+          posts.forEach((child: any) => {
+            const post = child.data;
+            const titleAndText = (post.title + ' ' + (post.selftext || '')).toLowerCase();
+
+            // Filter: only include posts that contain our target keywords
+            const hasKeyword = keywords.some(keyword => titleAndText.includes(keyword));
+
+            if (hasKeyword) {
+              allPosts.push({
+                id: post.id,
+                title: post.title,
+                author: post.author,
+                created: post.created_utc,
+                url: post.url,
+                permalink: `https://reddit.com${post.permalink}`,
+                selftext: post.selftext || '',
+                subreddit: post.subreddit,
+                score: post.score,
+                num_comments: post.num_comments,
+                company: extractCompany(post.title + ' ' + post.selftext),
+              });
+            }
+          });
+        } catch (err) {
+          console.error(`Error fetching from r/${subreddit}:`, err);
+          // Continue to next subreddit instead of failing completely
+        }
+      }
+
+      if (allPosts.length === 0) {
+        throw new Error('Could not fetch Reddit posts. Reddit may be rate limiting requests. Try pull-to-refresh in a few minutes.');
+      }
+
+      // Remove duplicates and sort by date
+      const uniquePosts = Array.from(new Map(allPosts.map(post => [post.id, post])).values());
+      const sortedPosts = uniquePosts.sort((a, b) => b.created - a.created);
+
+      // Cache the results and timestamp
+      await AsyncStorage.setItem(REDDIT_CACHE_KEY, JSON.stringify(sortedPosts));
+      await AsyncStorage.setItem(REDDIT_LAST_FETCH_KEY, Date.now().toString());
+
+      setPosts(sortedPosts);
+      setError(null);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    }
+  }
+
+  async function handleRefresh() {
+    // Check if enough time has passed since last fetch
+    const lastFetchStr = await AsyncStorage.getItem(REDDIT_LAST_FETCH_KEY);
+    if (lastFetchStr) {
+      const lastFetch = parseInt(lastFetchStr, 10);
+      const timeSinceLastFetch = Date.now() - lastFetch;
+
+      if (timeSinceLastFetch < REDDIT_REFRESH_COOLDOWN_MS) {
+        const minutesRemaining = Math.ceil((REDDIT_REFRESH_COOLDOWN_MS - timeSinceLastFetch) / 60000);
+        setError(`Please wait ${minutesRemaining} more minute${minutesRemaining > 1 ? 's' : ''} before refreshing.`);
+        setRefreshing(false);
+        return;
+      }
+    }
+
+    setRefreshing(true);
+    setError(null);
+    await fetchRedditPosts();
+    setRefreshing(false);
+  }
+
+  return (
+    <ScreenShell
+      loading={loading}
+      error={error}
+      onRefresh={handleRefresh}
+      refreshing={refreshing}
+      searchValue={searchQuery}
+      onSearchChange={setSearchQuery}
+      searchPlaceholder="Search Reddit posts"
+    >
+      <RedditScreen posts={posts} searchQuery={searchQuery} />
+    </ScreenShell>
+  );
+}
+
+function RedditScreen({ posts, searchQuery }: { posts: RedditPost[]; searchQuery: string }) {
+  const [expandedPost, setExpandedPost] = useState<string | null>(null);
+  const [range, setRange] = useState<NoticeRangeKey>('30d');
+
+  // Filter by time range first, then by search query
+  const rangeFilteredPosts = getRedditPostsForRange(posts, range);
+  const filteredPosts = filterRedditPosts(rangeFilteredPosts, searchQuery);
+
+  const rangeTitle = range === '7d'
+    ? 'Reddit discussions, last 7 days'
+    : range === '30d'
+    ? 'Reddit discussions, last 30 days'
+    : 'Reddit discussions, all time';
+
+  return (
+    <View style={styles.screen}>
+      <SegmentedControl options={noticeRanges} selected={range} onSelect={setRange} />
+
+      <Section eyebrow="Community Source" title={rangeTitle}>
+        {filteredPosts.length ? (
+          filteredPosts.map((post) => (
+            <RedditPostRow
+              key={post.id}
+              post={post}
+              isExpanded={expandedPost === post.id}
+              onToggle={() => setExpandedPost(expandedPost === post.id ? null : post.id)}
+            />
+          ))
+        ) : (
+          <Text style={styles.emptyText}>No Reddit posts found for this time period.</Text>
+        )}
+      </Section>
+    </View>
+  );
+}
+
+function RedditPostRow({ post, isExpanded, onToggle }: { post: RedditPost; isExpanded: boolean; onToggle: () => void }) {
+  const date = new Date(post.created * 1000);
+
+  return (
+    <View>
+      <Pressable
+        onPress={onToggle}
+        style={[styles.redditPostRow, isExpanded && styles.redditPostRowExpanded]}
+      >
+        <View style={styles.redditPostHeader}>
+          <View style={styles.redditMetaRow}>
+            <Text style={styles.redditSubreddit}>r/{post.subreddit}</Text>
+            <Text style={styles.redditAuthor}>u/{post.author}</Text>
+            <Text style={styles.redditDate}>{formatRedditDate(post.created)}</Text>
+          </View>
+          <Text style={styles.redditTitle} numberOfLines={isExpanded ? undefined : 2}>
+            {post.title}
+          </Text>
+          <View style={styles.redditStats}>
+            <Text style={styles.redditScore}>▲ {post.score}</Text>
+            <Text style={styles.redditComments}>💬 {post.num_comments}</Text>
+          </View>
+        </View>
+        <Text style={styles.expandIndicator}>{isExpanded ? '▼' : '▶'}</Text>
+      </Pressable>
+      {isExpanded && (
+        <View style={styles.redditPostDetails}>
+          {post.selftext && (
+            <View style={styles.redditSelfText}>
+              <Text style={styles.redditSelfTextContent} numberOfLines={10}>
+                {post.selftext}
+              </Text>
+            </View>
+          )}
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Posted</Text>
+            <Text style={styles.detailValue}>
+              {date.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
+            </Text>
+          </View>
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Score</Text>
+            <Text style={styles.detailValue}>{post.score.toLocaleString()}</Text>
+          </View>
+          <View style={styles.detailRow}>
+            <Text style={styles.detailLabel}>Comments</Text>
+            <Text style={styles.detailValue}>{post.num_comments.toLocaleString()}</Text>
+          </View>
+          <Pressable
+            style={styles.redditLinkButton}
+            onPress={() => {
+              Linking.openURL(post.permalink).catch((err) => console.error('Failed to open URL:', err));
+            }}
+          >
+            <Text style={styles.redditLinkButtonText}>View on Reddit →</Text>
+          </Pressable>
+        </View>
+      )}
+    </View>
+  );
+}
+
+function extractCompany(text: string): string | undefined {
+  // Extract capitalized company names (basic pattern)
+  const companyPattern = /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b/g;
+  const matches = text.match(companyPattern);
+
+  if (matches && matches.length > 0) {
+    return matches[0];
+  }
+
+  return undefined;
+}
+
+function getRedditPostsForRange(posts: RedditPost[], range: NoticeRangeKey): RedditPost[] {
+  const sorted = [...posts].sort((a, b) => b.created - a.created);
+
+  if (range === '7d') {
+    const cutoff = Date.now() / 1000 - 7 * 24 * 60 * 60;
+    return sorted.filter(post => post.created >= cutoff);
+  }
+
+  if (range === '30d') {
+    const cutoff = Date.now() / 1000 - 30 * 24 * 60 * 60;
+    return sorted.filter(post => post.created >= cutoff);
+  }
+
+  return sorted;
+}
+
+function filterRedditPosts(posts: RedditPost[], query: string): RedditPost[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) {
+    return posts;
+  }
+
+  return posts.filter((post) =>
+    `${post.title} ${post.selftext} ${post.subreddit} ${post.author} ${post.company || ''}`.toLowerCase().includes(normalizedQuery)
+  );
+}
+
+function formatRedditDate(timestamp: number): string {
+  const now = Date.now() / 1000;
+  const diff = now - timestamp;
+
+  if (diff < 3600) {
+    return `${Math.floor(diff / 60)}m ago`;
+  } else if (diff < 86400) {
+    return `${Math.floor(diff / 3600)}h ago`;
+  } else if (diff < 604800) {
+    return `${Math.floor(diff / 86400)}d ago`;
+  } else {
+    const date = new Date(timestamp * 1000);
+    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  }
 }
 
 function CompanyLogo({ company, refreshKey }: { company: string; refreshKey?: number }) {
@@ -1667,16 +2008,9 @@ const styles = StyleSheet.create({
   },
   loadingPanel: {
     alignItems: 'center',
-    backgroundColor: palette.panel,
-    borderColor: palette.faint,
-    borderRadius: 8,
-    borderWidth: 1,
-    gap: 12,
-    padding: 28,
-  },
-  loadingText: {
-    color: palette.muted,
-    fontSize: 14,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 200,
   },
   alert: {
     backgroundColor: palette.redSoft,
@@ -2093,5 +2427,107 @@ const styles = StyleSheet.create({
   },
   horizontalSectionBody: {
     marginTop: 14,
+  },
+  redditPostRow: {
+    borderBottomColor: palette.faint,
+    borderBottomWidth: 1,
+    flexDirection: 'row',
+    gap: 12,
+    paddingVertical: 14,
+  },
+  redditPostRowExpanded: {
+    backgroundColor: palette.soft,
+    borderBottomWidth: 0,
+    borderRadius: 8,
+    marginHorizontal: -8,
+    paddingHorizontal: 20,
+  },
+  redditPostHeader: {
+    flex: 1,
+    gap: 8,
+  },
+  redditMetaRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  redditSubreddit: {
+    color: palette.red,
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  redditAuthor: {
+    color: palette.muted,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  redditDate: {
+    color: palette.muted,
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  redditTitle: {
+    color: palette.ink,
+    fontSize: 16,
+    fontWeight: '900',
+    lineHeight: 22,
+  },
+  companyTag: {
+    alignSelf: 'flex-start',
+    backgroundColor: palette.redSoft,
+    borderColor: '#ffd1c5',
+    borderRadius: 4,
+    borderWidth: 1,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  companyTagText: {
+    color: palette.red,
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  redditStats: {
+    flexDirection: 'row',
+    gap: 16,
+  },
+  redditScore: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  redditComments: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  redditPostDetails: {
+    backgroundColor: palette.panel,
+    borderBottomColor: palette.faint,
+    borderBottomWidth: 1,
+    gap: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  redditSelfText: {
+    backgroundColor: palette.soft,
+    borderRadius: 6,
+    padding: 12,
+  },
+  redditSelfTextContent: {
+    color: palette.ink,
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  redditLinkButton: {
+    alignItems: 'center',
+    backgroundColor: palette.red,
+    borderRadius: 8,
+    marginTop: 8,
+    paddingVertical: 12,
+  },
+  redditLinkButtonText: {
+    color: palette.panel,
+    fontSize: 14,
+    fontWeight: '900',
   },
 });
