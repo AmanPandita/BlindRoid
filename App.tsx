@@ -268,16 +268,21 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (Platform.OS !== 'web') return;
+
     // Fetch current total count
     supabase
       .from('app_opens')
       .select('*', { count: 'exact', head: true })
-      .then(({ count }) => {
+      .then(({ count, error }) => {
+        if (error) console.error('[app_opens] select error:', error.message);
         if (count !== null) setTotalViewCount(count);
       });
 
     // Increment counter by inserting a new row
-    supabase.from('app_opens').insert({ opened_at: new Date().toISOString() });
+    supabase.from('app_opens').insert({ opened_at: new Date().toISOString() }).then(({ error }) => {
+      if (error) console.error('[app_opens] insert error:', error.message);
+    });
 
     // Subscribe to real-time inserts to update the count dynamically
     const channel = supabase
@@ -672,7 +677,7 @@ function OverviewScreen({ analytics, companyQuery, lastUpdatedAt, totalViewCount
 
           <View style={styles.metaRow}>
             <MetaPill label="Last updated" value={lastUpdatedAt ? formatUpdateTime(lastUpdatedAt) : 'Pending'} />
-            {totalViewCount > 0 && (
+            {Platform.OS === 'web' && totalViewCount > 0 && (
               <MetaPill label="Total viewers" value={totalViewCount.toLocaleString()} />
             )}
           </View>
