@@ -94,6 +94,8 @@ const CACHE_KEY = 'warnfirehose.warn_notices.v1';
 const REDDIT_CACHE_KEY = 'warnfirehose.reddit_posts.v1';
 const REDDIT_LAST_FETCH_KEY = 'warnfirehose.reddit_last_fetch.v1';
 const REDDIT_REFRESH_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes cooldown between refreshes
+const SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL!;
+const SUPABASE_KEY = process.env.EXPO_PUBLIC_SUPABASE_KEY!;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 const palette = {
@@ -865,13 +867,6 @@ function RedditScreenWrapper() {
     setError(null);
 
     try {
-      // Reddit API has CORS restrictions on web
-      if (Platform.OS === 'web') {
-        setError('Reddit integration is only available on the mobile app for now. Stay tuned for updates on this feature in the future!.');
-        setLoading(false);
-        return;
-      }
-
       // Try to load from cache first
       const cached = await AsyncStorage.getItem(REDDIT_CACHE_KEY);
       if (cached) {
@@ -912,11 +907,11 @@ function RedditScreenWrapper() {
             await new Promise(resolve => setTimeout(resolve, 2000));
           }
 
-          const url = `https://www.reddit.com/r/${subreddit}/search.json?q=${encodeURIComponent(query)}&restrict_sr=1&sort=new&limit=${limit}&t=month`;
+          const url = `${SUPABASE_URL}/functions/v1/reddit-proxy?subreddit=${subreddit}&q=${encodeURIComponent(query)}&limit=${limit}&t=month`;
 
           const response = await fetch(url, {
             headers: {
-              'User-Agent': 'bWARNed/1.0',
+              Authorization: `Bearer ${SUPABASE_KEY}`,
             },
           });
 
@@ -977,12 +972,6 @@ function RedditScreenWrapper() {
   }
 
   async function handleRefresh() {
-    // Disable refresh on web
-    if (Platform.OS === 'web') {
-      setError('Reddit integration is only available on mobile due to browser CORS restrictions.');
-      return;
-    }
-
     // Check if enough time has passed since last fetch
     const lastFetchStr = await AsyncStorage.getItem(REDDIT_LAST_FETCH_KEY);
     if (lastFetchStr) {
@@ -1285,8 +1274,7 @@ function CompanyRow({ index, logoRefreshKey, row, showStock = false, isExpanded 
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
-    // Disable stock quotes on web due to CORS
-    if (!showStock || !ticker || Platform.OS === 'web') {
+    if (!showStock || !ticker) {
       return;
     }
 
@@ -1294,10 +1282,9 @@ function CompanyRow({ index, logoRefreshKey, row, showStock = false, isExpanded 
 
     async function loadQuote() {
       try {
-        const response = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`, {
+        const response = await fetch(`${SUPABASE_URL}/functions/v1/yahoo-proxy?ticker=${ticker}`, {
           headers: {
-            Accept: 'application/json',
-            'User-Agent': 'Mozilla/5.0',
+            Authorization: `Bearer ${SUPABASE_KEY}`,
           },
         });
         const json = await response.json();
