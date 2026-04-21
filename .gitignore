@@ -40,3 +40,11 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# Claude Code
+.claude/
+.mcp.json
+code-review-graph/
+graph-output/
+scripts/code-review-graph.sh
+scripts/run-graph.sh
