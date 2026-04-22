@@ -18,7 +18,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import Svg, { Circle, Path } from 'react-native-svg';
 
 declare const process: {
@@ -45,18 +45,15 @@ type WarnNotice = {
   ticker?: string;
 };
 
-type CachePayload = {
-  savedAt: string;
-  notices: WarnNotice[];
-};
+
 
 type RootTabParamList = {
-  Overview: undefined;
-  Companies: undefined;
-  Regions: undefined;
-  Notices: undefined;
+  Home: undefined;
   Reddit: undefined;
 };
+
+type DateRangeKey = '7d' | '30d' | '90d' | '1y' | 'all';
+type SortKey = 'date' | 'employees' | 'company';
 
 type RankedRow = {
   label: string;
@@ -90,7 +87,6 @@ type RedditPost = {
   company?: string;
 };
 
-const CACHE_KEY = 'warnfirehose.warn_notices.v1';
 const REDDIT_CACHE_KEY = 'warnfirehose.reddit_posts.v1';
 const REDDIT_LAST_FETCH_KEY = 'warnfirehose.reddit_last_fetch.v1';
 const REDDIT_REFRESH_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes cooldown between refreshes
@@ -125,6 +121,29 @@ const noticeRanges: { key: NoticeRangeKey; label: string }[] = [
   { key: '7d', label: '7D' },
   { key: '30d', label: '30D' },
   { key: 'all', label: 'All' },
+];
+
+const dateRangeOptions: { key: DateRangeKey; label: string; days: number }[] = [
+  { key: '7d', label: '7D', days: 7 },
+  { key: '30d', label: '30D', days: 30 },
+  { key: '90d', label: '90D', days: 90 },
+  { key: '1y', label: '1Y', days: 365 },
+  { key: 'all', label: 'All', days: Infinity },
+];
+
+const employeeFilterOptions: { value: number; label: string }[] = [
+  { value: 0, label: 'Any' },
+  { value: 50, label: '50+' },
+  { value: 100, label: '100+' },
+  { value: 250, label: '250+' },
+  { value: 500, label: '500+' },
+  { value: 1000, label: '1K+' },
+];
+
+const sortOptions: { key: SortKey; label: string }[] = [
+  { key: 'date', label: 'Newest' },
+  { key: 'employees', label: 'Impact' },
+  { key: 'company', label: 'A–Z' },
 ];
 
 const knownCompanyDomains: Record<string, string> = {
@@ -257,153 +276,24 @@ const sampleNotices: WarnNotice[] = [
 ];
 
 export default function App() {
-  const [notices, setNotices] = useState<WarnNotice[]>([]);
-  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [totalViewCount, setTotalViewCount] = useState(0);
-
-  useEffect(() => {
-    loadCachedThenRefresh();
-  }, []);
-
-  useEffect(() => {
-    if (Platform.OS !== 'web') return;
-
-    // Fetch current total count
-    supabase
-      .from('app_opens')
-      .select('*', { count: 'exact', head: true })
-      .then(({ count, error }) => {
-        if (error) console.error('[app_opens] select error:', error.message);
-        if (count !== null) setTotalViewCount(count);
-      });
-
-    // Increment counter by inserting a new row
-    supabase.from('app_opens').insert({ opened_at: new Date().toISOString() }).then(({ error }) => {
-      if (error) console.error('[app_opens] insert error:', error.message);
-    });
-
-    // Subscribe to real-time inserts to update the count dynamically
-    const channel = supabase
-      .channel('app_opens_changes')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'app_opens' }, () => {
-        setTotalViewCount((prev) => prev + 1);
-      })
-      .subscribe();
-
-    return () => { supabase.removeChannel(channel); };
-  }, []);
-
-  const analytics = useMemo(() => buildAnalytics(notices), [notices]);
-
-  async function loadCachedThenRefresh() {
-    setLoading(true);
-    setError(null);
-
-    // Show cached data immediately while the DB fetch runs
-    try {
-      const cached = await AsyncStorage.getItem(CACHE_KEY);
-      if (cached) {
-        const payload = JSON.parse(cached) as CachePayload;
-        if (payload.notices.length) {
-          setNotices(payload.notices);
-          setLastUpdatedAt(payload.savedAt);
-          setLoading(false); // show stale data right away
-        }
-      }
-    } catch {
-      // ignore cache read errors
-    }
-
-    // Always fetch fresh from Supabase — DB is always up to date via the sync script
-    try {
-      await fetchAndCache();
-    } catch (nextError) {
-      setError(getErrorMessage(nextError));
-      // If we have no data at all yet, fall back to sample notices
-      setNotices((current) => (current.length ? current : sampleNotices));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function fetchAndCache() {
-    const allRecords: WarnNotice[] = [];
-    let from = 0;
-    const pageSize = 1000;
-
-    while (true) {
-      const { data, error: queryError } = await supabase
-        .from('warn_notices')
-        .select('*')
-        .order('date', { ascending: false })
-        .range(from, from + pageSize - 1);
-
-      if (queryError) throw new Error(queryError.message);
-      if (!data || data.length === 0) break;
-
-      allRecords.push(...(data as WarnNotice[]));
-      if (data.length < pageSize) break;
-      from += pageSize;
-    }
-
-    if (!allRecords.length) {
-      throw new Error('No WARN notices found in database. Run the sync script to populate data.');
-    }
-
-    const savedAt = new Date().toISOString();
-    await AsyncStorage.setItem(CACHE_KEY, JSON.stringify({ savedAt, notices: allRecords }));
-    setNotices(allRecords);
-    setLastUpdatedAt(savedAt);
-  }
-
   return (
     <SafeAreaProvider>
       <NavigationContainer ref={navigationRef}>
         <StatusBar style="dark" />
-        <AppTabs
-          analytics={analytics}
-          error={error}
-          lastUpdatedAt={lastUpdatedAt}
-          totalViewCount={totalViewCount}
-          loading={loading}
-          notices={notices}
-          totalCount={notices.length}
-        />
+        <AppTabs />
       </NavigationContainer>
     </SafeAreaProvider>
   );
 }
 
-function AppTabs({
-  analytics,
-  error,
-  lastUpdatedAt,
-  totalViewCount,
-  loading,
-  notices,
-  totalCount,
-}: {
-  analytics: Analytics;
-  error: string | null;
-  lastUpdatedAt: string | null;
-  totalViewCount: number;
-  loading: boolean;
-  notices: WarnNotice[];
-  totalCount: number;
-}) {
-  const insets = useSafeAreaInsets();
-
+function AppTabs() {
   const isWeb = Platform.OS === 'web';
 
   return (
     <Tab.Navigator
       screenOptions={({ route }: { route: { name: keyof RootTabParamList } }) => ({
         headerShown: false,
-        sceneStyle: {
-          backgroundColor: palette.page,
-        },
+        sceneStyle: { backgroundColor: palette.page },
         tabBarActiveTintColor: palette.red,
         tabBarInactiveTintColor: palette.muted,
         ...(isWeb ? {
@@ -414,28 +304,15 @@ function AppTabs({
           tabBarIconStyle: styles.navigatorIconSlot,
           tabBarItemStyle: styles.navigatorItem,
           tabBarLabelStyle: styles.navigatorLabel,
-          tabBarStyle: [
-            styles.navigatorBar,
-            {
-              height: 48 + insets.bottom,
-              paddingBottom: insets.bottom,
-            },
-          ],
-          tabBarIcon: ({ color, focused }: { color: string; focused: boolean; size: number }) => <TabGlyph color={color} focused={focused} name={route.name} />,
+          tabBarStyle: styles.navigatorBar,
+          tabBarIcon: ({ color, focused }: { color: string; focused: boolean; size: number }) => (
+            <TabGlyph color={color} focused={focused} name={route.name} />
+          ),
         }),
       })}
     >
-      <Tab.Screen name="Overview">
-        {() => <OverviewScreenWrapper analytics={analytics} error={error} lastUpdatedAt={lastUpdatedAt} totalViewCount={totalViewCount} loading={loading} notices={notices} totalCount={totalCount} />}
-      </Tab.Screen>
-      <Tab.Screen name="Companies">
-        {() => <CompaniesScreenWrapper analytics={analytics} error={error} loading={loading} />}
-      </Tab.Screen>
-      <Tab.Screen name="Regions">
-        {() => <RegionsScreenWrapper analytics={analytics} error={error} loading={loading} />}
-      </Tab.Screen>
-      <Tab.Screen name="Notices">
-        {() => <NoticesScreenWrapper error={error} loading={loading} notices={notices} />}
+      <Tab.Screen name="Home">
+        {() => <HomeScreenWrapper />}
       </Tab.Screen>
       <Tab.Screen name="Reddit">
         {() => <RedditScreenWrapper />}
@@ -444,26 +321,175 @@ function AppTabs({
   );
 }
 
-function ScreenShell({ children, error, loading, onRefresh, refreshing, searchValue, onSearchChange, searchPlaceholder, showRefreshButton }: { children: ReactNode; error: string | null; loading: boolean; onRefresh?: () => void; refreshing?: boolean; searchValue?: string; onSearchChange?: (value: string) => void; searchPlaceholder?: string; showRefreshButton?: boolean }) {
+// ─── HOME SCREEN ────────────────────────────────────────────────────────────
+
+function HomeScreenWrapper() {
+  const [notices, setNotices] = useState<WarnNotice[]>([]);
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [dateRange, setDateRange] = useState<DateRangeKey>('30d');
+  const [selectedState, setSelectedState] = useState('');
+  const [selectedIndustry, setSelectedIndustry] = useState('');
+  const [minEmployees, setMinEmployees] = useState(0);
+  const [sortBy, setSortBy] = useState<SortKey>('date');
+  const [showFilters, setShowFilters] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [expandedNotice, setExpandedNotice] = useState<string | null>(null);
+  const [logoRefreshKey, setLogoRefreshKey] = useState(0);
+
   const tabBarHeight = Platform.OS === 'web' ? 0 : useBottomTabBarHeight();
 
+  useEffect(() => {
+    fetchFromSupabase();
+  }, []);
+
+  async function fetchFromSupabase(isRefresh = false) {
+    if (!isRefresh) setLoading(true);
+    setError(null);
+
+    try {
+      const allRecords: WarnNotice[] = [];
+      let from = 0;
+      const pageSize = 1000;
+
+      while (true) {
+        const { data, error: queryError } = await supabase
+          .from('warn_notices')
+          .select('*')
+          .order('date', { ascending: false })
+          .range(from, from + pageSize - 1);
+
+        if (queryError) throw new Error(queryError.message);
+        if (!data || data.length === 0) break;
+
+        allRecords.push(...(data as WarnNotice[]));
+        if (data.length < pageSize) break;
+        from += pageSize;
+      }
+
+      if (!allRecords.length) {
+        throw new Error('No WARN notices found in database. Run the sync script to populate data.');
+      }
+
+      setNotices(allRecords);
+      setLastUpdatedAt(new Date().toISOString());
+    } catch (err) {
+      setError(getErrorMessage(err));
+      if (!isRefresh) setNotices(sampleNotices);
+    } finally {
+      if (!isRefresh) setLoading(false);
+    }
+  }
+
+  // Derive available filter values from data
+  const availableStates = useMemo(() => {
+    const counts = new Map<string, number>();
+    notices.forEach((n) => { if (n.state && n.state !== 'NA') counts.set(n.state, (counts.get(n.state) ?? 0) + 1); });
+    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).map(([s]) => s).slice(0, 20);
+  }, [notices]);
+
+  const availableIndustries = useMemo(() => {
+    const counts = new Map<string, number>();
+    notices.forEach((n) => { if (n.industry && n.industry !== 'Unclassified') counts.set(n.industry, (counts.get(n.industry) ?? 0) + 1); });
+    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).map(([i]) => i).slice(0, 15);
+  }, [notices]);
+
+  // Apply all filters
+  const filteredNotices = useMemo(() => {
+    let result = [...notices];
+
+    if (dateRange !== 'all') {
+      const days = dateRangeOptions.find((o) => o.key === dateRange)!.days;
+      const cutoff = Date.now() - days * DAY_MS;
+      result = result.filter((n) => toTime(n.date) >= cutoff);
+    }
+
+    const q = searchQuery.trim().toLowerCase();
+    if (q) {
+      result = result.filter((n) =>
+        `${n.company} ${n.city} ${n.state} ${n.industry} ${n.reason}`.toLowerCase().includes(q)
+      );
+    }
+
+    if (selectedState) result = result.filter((n) => n.state === selectedState);
+    if (selectedIndustry) result = result.filter((n) => n.industry === selectedIndustry);
+    if (minEmployees > 0) result = result.filter((n) => n.employees >= minEmployees);
+
+    switch (sortBy) {
+      case 'date': result.sort((a, b) => toTime(b.date) - toTime(a.date)); break;
+      case 'employees': result.sort((a, b) => b.employees - a.employees); break;
+      case 'company': result.sort((a, b) => a.company.localeCompare(b.company)); break;
+    }
+    return result;
+  }, [notices, dateRange, searchQuery, selectedState, selectedIndustry, minEmployees, sortBy]);
+
+  const stats = useMemo(() => {
+    const workers = filteredNotices.reduce((s, n) => s + n.employees, 0);
+    return {
+      count: filteredNotices.length,
+      workers,
+      companies: new Set(filteredNotices.map((n) => n.company)).size,
+      avg: filteredNotices.length ? Math.round(workers / filteredNotices.length) : 0,
+    };
+  }, [filteredNotices]);
+
+  const activeFilterCount =
+    (selectedState ? 1 : 0) +
+    (selectedIndustry ? 1 : 0) +
+    (minEmployees > 0 ? 1 : 0) +
+    (sortBy !== 'date' ? 1 : 0);
+
+  function clearFilters() {
+    setSelectedState('');
+    setSelectedIndustry('');
+    setMinEmployees(0);
+    setSortBy('date');
+  }
+
+  async function handleRefresh() {
+    setRefreshing(true);
+    setLogoRefreshKey((k) => k + 1);
+    await fetchFromSupabase(true);
+    setRefreshing(false);
+  }
+
   return (
-    <SafeAreaView edges={['top']} style={styles.safeArea}>
-      <ScrollView
-        contentContainerStyle={[styles.content, { paddingBottom: tabBarHeight + 18 }]}
-        refreshControl={
-          onRefresh && Platform.OS !== 'web' ? (
-            <RefreshControl
-              refreshing={refreshing || false}
-              onRefresh={onRefresh}
-              tintColor={palette.red}
-              colors={[palette.red]}
+    <SafeAreaView edges={['top', 'left', 'right']} style={styles.safeArea}>
+      {/* ── Fixed header (never shifts on scroll) ── */}
+      <View style={styles.redditFixedHeader}>
+        <View style={styles.homeHeaderTop}>
+          <View style={styles.logoMark}>
+            <Text style={styles.logoText}>b{'\n'}WARN{'\n'}ed</Text>
+          </View>
+          <View style={styles.searchInputContainer}>
+            <TextInput
+              autoCapitalize="none"
+              clearButtonMode={Platform.OS === 'ios' ? 'while-editing' : 'never'}
+              onChangeText={setSearchQuery}
+              placeholder="Search companies, cities, states, industries…"
+              placeholderTextColor={palette.muted}
+              style={styles.headerSearchInput}
+              value={searchQuery}
             />
-          ) : undefined
+            {Platform.OS === 'android' && searchQuery.length > 0 && (
+              <Pressable onPress={() => setSearchQuery('')} style={styles.clearButton} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                <Text style={styles.clearButtonText}>✕</Text>
+              </Pressable>
+            )}
+          </View>
+        </View>
+      </View>
+
+      {/* ── Scrollable content ── */}
+      <ScrollView
+        contentContainerStyle={[styles.homeContent, { paddingBottom: tabBarHeight + 18 }]}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} tintColor={palette.red} colors={[palette.red]} />
         }
         showsVerticalScrollIndicator={false}
       >
-        <Header searchValue={searchValue} onSearchChange={onSearchChange} searchPlaceholder={searchPlaceholder} showRefreshButton={showRefreshButton} onRefresh={onRefresh} refreshing={refreshing} />
         {loading ? (
           <View style={styles.loadingPanel}>
             <ActivityIndicator color={palette.red} size="large" />
@@ -476,7 +502,162 @@ function ScreenShell({ children, error, loading, onRefresh, refreshing, searchVa
                 <Text style={styles.alertText}>{error}</Text>
               </View>
             ) : null}
-            {children}
+
+            {/* ── Date range ── */}
+            <View style={styles.dateRangeRow}>
+              {dateRangeOptions.map((opt) => (
+                <Pressable
+                  key={opt.key}
+                  onPress={() => setDateRange(opt.key)}
+                  style={[styles.dateChip, dateRange === opt.key && styles.dateChipActive]}
+                >
+                  <Text style={[styles.dateChipText, dateRange === opt.key && styles.dateChipTextActive]}>
+                    {opt.label}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+
+            {/* ── Filter toggle + sort ── */}
+            <View style={styles.filterControlRow}>
+              <Pressable
+                onPress={() => setShowFilters((v) => !v)}
+                style={[styles.filterToggleBtn, showFilters && styles.filterToggleBtnActive, activeFilterCount > 0 && styles.filterToggleBtnBadged]}
+              >
+                <Text style={[styles.filterToggleBtnText, (showFilters || activeFilterCount > 0) && styles.filterToggleBtnTextActive]}>
+                  ⚡ Filters{activeFilterCount > 0 ? `  ${activeFilterCount}` : ''}
+                </Text>
+              </Pressable>
+              <View style={styles.sortRow}>
+                {sortOptions.map((opt) => (
+                  <Pressable
+                    key={opt.key}
+                    onPress={() => setSortBy(opt.key)}
+                    style={[styles.sortChip, sortBy === opt.key && styles.sortChipActive]}
+                  >
+                    <Text style={[styles.sortChipText, sortBy === opt.key && styles.sortChipTextActive]}>{opt.label}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+
+            {/* ── Expandable filter panel ── */}
+            {showFilters && (
+              <View style={styles.filterPanel}>
+                <Text style={styles.filterGroupLabel}>STATE</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterChipsRow}>
+                  <Pressable
+                    onPress={() => setSelectedState('')}
+                    style={[styles.filterChip, selectedState === '' && styles.filterChipActive]}
+                  >
+                    <Text style={[styles.filterChipText, selectedState === '' && styles.filterChipTextActive]}>All</Text>
+                  </Pressable>
+                  {availableStates.map((state) => (
+                    <Pressable
+                      key={state}
+                      onPress={() => setSelectedState(selectedState === state ? '' : state)}
+                      style={[styles.filterChip, selectedState === state && styles.filterChipActive]}
+                    >
+                      <Text style={[styles.filterChipText, selectedState === state && styles.filterChipTextActive]}>{state}</Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+
+                <Text style={styles.filterGroupLabel}>INDUSTRY</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterChipsRow}>
+                  <Pressable
+                    onPress={() => setSelectedIndustry('')}
+                    style={[styles.filterChip, selectedIndustry === '' && styles.filterChipActive]}
+                  >
+                    <Text style={[styles.filterChipText, selectedIndustry === '' && styles.filterChipTextActive]}>All</Text>
+                  </Pressable>
+                  {availableIndustries.map((industry) => (
+                    <Pressable
+                      key={industry}
+                      onPress={() => setSelectedIndustry(selectedIndustry === industry ? '' : industry)}
+                      style={[styles.filterChip, selectedIndustry === industry && styles.filterChipActive]}
+                    >
+                      <Text style={[styles.filterChipText, selectedIndustry === industry && styles.filterChipTextActive]}>{industry}</Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+
+                <Text style={styles.filterGroupLabel}>MIN IMPACT</Text>
+                <View style={styles.filterChipsRow}>
+                  {employeeFilterOptions.map((opt) => (
+                    <Pressable
+                      key={opt.value}
+                      onPress={() => setMinEmployees(opt.value)}
+                      style={[styles.filterChip, minEmployees === opt.value && styles.filterChipActive]}
+                    >
+                      <Text style={[styles.filterChipText, minEmployees === opt.value && styles.filterChipTextActive]}>{opt.label}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+
+                {activeFilterCount > 0 && (
+                  <Pressable onPress={clearFilters} style={styles.clearFiltersBtn}>
+                    <Text style={styles.clearFiltersBtnText}>Clear all filters</Text>
+                  </Pressable>
+                )}
+              </View>
+            )}
+
+            {/* ── Active filter pills (when panel is closed) ── */}
+            {!showFilters && activeFilterCount > 0 && (
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.activeFiltersRow}>
+                {selectedState ? (
+                  <Pressable onPress={() => setSelectedState('')} style={styles.activeFilterPill}>
+                    <Text style={styles.activeFilterPillText}>{selectedState} ×</Text>
+                  </Pressable>
+                ) : null}
+                {selectedIndustry ? (
+                  <Pressable onPress={() => setSelectedIndustry('')} style={styles.activeFilterPill}>
+                    <Text style={styles.activeFilterPillText}>{selectedIndustry} ×</Text>
+                  </Pressable>
+                ) : null}
+                {minEmployees > 0 ? (
+                  <Pressable onPress={() => setMinEmployees(0)} style={styles.activeFilterPill}>
+                    <Text style={styles.activeFilterPillText}>{minEmployees >= 1000 ? '1K+' : `${minEmployees}+`} workers ×</Text>
+                  </Pressable>
+                ) : null}
+                {sortBy !== 'date' ? (
+                  <Pressable onPress={() => setSortBy('date')} style={styles.activeFilterPill}>
+                    <Text style={styles.activeFilterPillText}>Sort: {sortOptions.find((o) => o.key === sortBy)?.label} ×</Text>
+                  </Pressable>
+                ) : null}
+                <Pressable onPress={clearFilters} style={styles.clearAllPill}>
+                  <Text style={styles.clearAllPillText}>Clear all</Text>
+                </Pressable>
+              </ScrollView>
+            )}
+
+            {/* ── Results summary bar ── */}
+            <View style={styles.resultsSummaryBar}>
+              <Text style={styles.resultsSummaryCount}>
+                {stats.count.toLocaleString()} notice{stats.count !== 1 ? 's' : ''} · {stats.workers.toLocaleString()} workers
+              </Text>
+              {lastUpdatedAt ? (
+                <Text style={styles.resultsSummaryMeta}>Updated {formatUpdateTime(lastUpdatedAt)}</Text>
+              ) : null}
+            </View>
+
+            {/* ── Notice list ── */}
+            <View style={styles.section}>
+              {filteredNotices.length ? (
+                filteredNotices.map((notice) => (
+                  <NoticeRow
+                    key={notice.id}
+                    logoRefreshKey={logoRefreshKey}
+                    notice={notice}
+                    isExpanded={expandedNotice === notice.id}
+                    onToggle={() => setExpandedNotice(expandedNotice === notice.id ? null : notice.id)}
+                  />
+                ))
+              ) : (
+                <Text style={styles.emptyText}>No notices match your filters. Try broadening your search.</Text>
+              )}
+            </View>
           </>
         )}
       </ScrollView>
@@ -484,45 +665,12 @@ function ScreenShell({ children, error, loading, onRefresh, refreshing, searchVa
   );
 }
 
-function Header({ searchValue, onSearchChange, searchPlaceholder, showRefreshButton, onRefresh, refreshing }: { searchValue?: string; onSearchChange?: (value: string) => void; searchPlaceholder?: string; showRefreshButton?: boolean; onRefresh?: () => void; refreshing?: boolean }) {
+function StatCard({ accent, label, value }: { accent: string; label: string; value: string }) {
   return (
-    <View style={styles.header}>
-      <View style={styles.logoRow}>
-        <View style={styles.logoMark}>
-          <Text style={styles.logoText}>b{'\n'}WARN{'\n'}ed</Text>
-        </View>
-        {onSearchChange && (
-          <View style={styles.searchInputContainer}>
-            <TextInput
-              autoCapitalize="none"
-              clearButtonMode={Platform.OS === 'ios' ? 'while-editing' : 'never'}
-              onChangeText={onSearchChange}
-              placeholder={searchPlaceholder || "Search"}
-              placeholderTextColor={palette.muted}
-              style={styles.headerSearchInput}
-              value={searchValue}
-            />
-            {Platform.OS === 'android' && searchValue && searchValue.length > 0 && (
-              <Pressable
-                onPress={() => onSearchChange('')}
-                style={styles.clearButton}
-                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-              >
-                <Text style={styles.clearButtonText}>✕</Text>
-              </Pressable>
-            )}
-          </View>
-        )}
-        {showRefreshButton && Platform.OS === 'web' && onRefresh && (
-          <Pressable
-            onPress={onRefresh}
-            style={[styles.refreshButton, refreshing && styles.refreshButtonDisabled]}
-            disabled={refreshing}
-          >
-            <Text style={styles.refreshButtonText}>{refreshing ? '⟳ Refreshing...' : '⟳ Refresh'}</Text>
-          </Pressable>
-        )}
-      </View>
+    <View style={styles.statCard}>
+      <View style={[styles.statCardAccentBar, { backgroundColor: accent }]} />
+      <Text style={styles.statCardValue}>{value}</Text>
+      <Text style={styles.statCardLabel}>{label}</Text>
     </View>
   );
 }
@@ -539,35 +687,13 @@ function TabGlyph({ color, focused, name }: { color: string; focused: boolean; n
 
 function tabIcon(name: keyof RootTabParamList, color: string) {
   switch (name) {
-    case 'Overview':
+    case 'Home':
       return (
         <>
           <Path d="M4 18V9" stroke={color} strokeLinecap="round" strokeWidth={2.3} />
           <Path d="M10 18V5" stroke={color} strokeLinecap="round" strokeWidth={2.3} />
           <Path d="M16 18v-7" stroke={color} strokeLinecap="round" strokeWidth={2.3} />
           <Path d="M22 18v-4" stroke={color} strokeLinecap="round" strokeWidth={2.3} />
-        </>
-      );
-    case 'Companies':
-      return (
-        <>
-          <Path d="M5 20V6.5L12 3l7 3.5V20" fill="none" stroke={color} strokeLinejoin="round" strokeWidth={2.1} />
-          <Path d="M9 20v-5h6v5" fill="none" stroke={color} strokeLinejoin="round" strokeWidth={2.1} />
-          <Path d="M9 9h.01M12 9h.01M15 9h.01" stroke={color} strokeLinecap="round" strokeWidth={3} />
-        </>
-      );
-    case 'Regions':
-      return (
-        <>
-          <Circle cx={12} cy={10} r={3} fill="none" stroke={color} strokeWidth={2.1} />
-          <Path d="M19 10c0 5-7 11-7 11S5 15 5 10a7 7 0 1 1 14 0Z" fill="none" stroke={color} strokeLinejoin="round" strokeWidth={2.1} />
-        </>
-      );
-    case 'Notices':
-      return (
-        <>
-          <Path d="M7 4h8l3 3v13H7z" fill="none" stroke={color} strokeLinejoin="round" strokeWidth={2.1} />
-          <Path d="M14 4v4h4M10 12h5M10 16h5" stroke={color} strokeLinecap="round" strokeWidth={2.1} />
         </>
       );
     case 'Reddit':
@@ -582,272 +708,7 @@ function tabIcon(name: keyof RootTabParamList, color: string) {
   }
 }
 
-function OverviewScreenWrapper({ analytics, error, lastUpdatedAt, totalViewCount, loading, notices, totalCount }: { analytics: Analytics; error: string | null; lastUpdatedAt: string | null; totalViewCount: number; loading: boolean; notices: WarnNotice[]; totalCount: number }) {
-  const [companyQuery, setCompanyQuery] = useState('');
-  const [refreshing, setRefreshing] = useState(false);
-  const [logoRefreshKey, setLogoRefreshKey] = useState(0);
-  const [localAnalytics, setLocalAnalytics] = useState(analytics);
-
-  async function handleRefresh() {
-    setRefreshing(true);
-    // Recalculate analytics from current notices
-    setLocalAnalytics(buildAnalytics(notices));
-    // Increment logo refresh key to force logo re-fetching
-    setLogoRefreshKey((current) => current + 1);
-    // Simulate a brief refresh action
-    await new Promise(resolve => setTimeout(resolve, 500));
-    setRefreshing(false);
-  }
-
-  // Update local analytics when parent analytics changes
-  useEffect(() => {
-    setLocalAnalytics(analytics);
-  }, [analytics]);
-
-  return (
-    <ScreenShell loading={loading} error={error} onRefresh={handleRefresh} refreshing={refreshing} searchValue={companyQuery} onSearchChange={setCompanyQuery} searchPlaceholder="Search companies">
-      <OverviewScreen
-        analytics={localAnalytics}
-        companyQuery={companyQuery}
-        lastUpdatedAt={lastUpdatedAt}
-        totalViewCount={totalViewCount}
-        logoRefreshKey={logoRefreshKey}
-        notices={notices}
-        totalCount={totalCount}
-      />
-    </ScreenShell>
-  );
-}
-
-function OverviewScreen({ analytics, companyQuery, lastUpdatedAt, totalViewCount, logoRefreshKey, notices, totalCount }: { analytics: Analytics; companyQuery: string; lastUpdatedAt: string | null; totalViewCount: number; logoRefreshKey: number; notices: WarnNotice[]; totalCount: number }) {
-  const [range, setRange] = useState<CompanyRangeKey>('30d');
-  const isSearching = companyQuery.trim().length > 0;
-
-  // When searching, group and rank all notices that match the query
-  const topCompanies = isSearching
-    ? (() => {
-        const companies = groupBy(notices, (notice) => notice.company || 'Unknown company');
-        const allRanked = rankGroups(companies);
-        return filterRankedRows(allRanked, companyQuery).slice(0, 5);
-      })()
-    : getCompanyRowsForRange(analytics, range).slice(0, 5);
-
-  const topRegions = getRegionRowsForRange(analytics, range).slice(0, 5);
-  const topIndustries = getIndustryRowsForRange(analytics, range).slice(0, 5);
-
-  // Check if searched company is in top 5
-  const hasSearchedCompanyInTop5 = isSearching && topCompanies.length > 0;
-  const momentumTitle = isSearching && !hasSearchedCompanyInTop5 ? "All Companies" : getMomentumTitle(range);
-  const regionsTitle = getRegionsTitle(range);
-  const industriesTitle = getIndustriesTitle(range);
-
-  return (
-    <View style={styles.screen}>
-      {!isSearching && (
-        <SegmentedControl options={companyRanges} selected={range} onSelect={setRange} />
-      )}
-
-      <Section eyebrow="Momentum" title={momentumTitle}>
-        <RankList rows={topCompanies} emptyLabel={isSearching ? "No matching companies found." : `No matching companies in the selected period.`} logoRefreshKey={logoRefreshKey} showStock />
-      </Section>
-
-      {!isSearching && (
-        <>
-          {Platform.OS === 'web' ? (
-            <View style={styles.horizontalSectionsContainerWeb}>
-              <View style={[styles.horizontalSection, styles.horizontalSectionWeb]}>
-                <Text style={styles.horizontalSectionEyebrow}>Geography</Text>
-                <Text style={styles.horizontalSectionTitle}>{regionsTitle}</Text>
-                <View style={styles.horizontalSectionBody}>
-                  <BarList rows={topRegions} />
-                </View>
-              </View>
-
-              <View style={[styles.horizontalSection, styles.horizontalSectionWeb]}>
-                <Text style={styles.horizontalSectionEyebrow}>Sectors</Text>
-                <Text style={styles.horizontalSectionTitle}>{industriesTitle}</Text>
-                <View style={styles.horizontalSectionBody}>
-                  <BarList rows={topIndustries} />
-                </View>
-              </View>
-            </View>
-          ) : (
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.horizontalSectionsContainer}
-            >
-              <View style={styles.horizontalSection}>
-                <Text style={styles.horizontalSectionEyebrow}>Geography</Text>
-                <Text style={styles.horizontalSectionTitle}>{regionsTitle}</Text>
-                <View style={styles.horizontalSectionBody}>
-                  <BarList rows={topRegions} />
-                </View>
-              </View>
-
-              <View style={styles.horizontalSection}>
-                <Text style={styles.horizontalSectionEyebrow}>Sectors</Text>
-                <Text style={styles.horizontalSectionTitle}>{industriesTitle}</Text>
-                <View style={styles.horizontalSectionBody}>
-                  <BarList rows={topIndustries} />
-                </View>
-              </View>
-            </ScrollView>
-          )}
-
-          <View style={styles.metaRow}>
-            <MetaPill label="Last updated" value={lastUpdatedAt ? formatUpdateTime(lastUpdatedAt) : 'Pending'} />
-            {Platform.OS === 'web' && totalViewCount > 0 && (
-              <MetaPill label="Total viewers" value={totalViewCount.toLocaleString()} />
-            )}
-          </View>
-        </>
-      )}
-    </View>
-  );
-}
-
-function CompaniesScreenWrapper({ analytics, error, loading }: { analytics: Analytics; error: string | null; loading: boolean }) {
-  const [companyQuery, setCompanyQuery] = useState('');
-  const [refreshing, setRefreshing] = useState(false);
-  const [logoRefreshKey, setLogoRefreshKey] = useState(0);
-  const [localAnalytics, setLocalAnalytics] = useState(analytics);
-
-  async function handleRefresh() {
-    setRefreshing(true);
-    // Recalculate analytics - force re-render
-    setLocalAnalytics({ ...analytics });
-    // Increment logo refresh key to force logo re-fetching
-    setLogoRefreshKey((current) => current + 1);
-    // Simulate a brief refresh action
-    await new Promise(resolve => setTimeout(resolve, 500));
-    setRefreshing(false);
-  }
-
-  // Update local analytics when parent analytics changes
-  useEffect(() => {
-    setLocalAnalytics(analytics);
-  }, [analytics]);
-
-  return (
-    <ScreenShell loading={loading} error={error} onRefresh={handleRefresh} refreshing={refreshing} searchValue={companyQuery} onSearchChange={setCompanyQuery} searchPlaceholder="Search companies">
-      <CompaniesScreen analytics={localAnalytics} companyQuery={companyQuery} logoRefreshKey={logoRefreshKey} />
-    </ScreenShell>
-  );
-}
-
-function CompaniesScreen({ analytics, companyQuery, logoRefreshKey }: { analytics: Analytics; companyQuery: string; logoRefreshKey: number }) {
-  const [range, setRange] = useState<CompanyRangeKey>('30d');
-  const rows = filterRankedRows(getCompanyRowsForRange(analytics, range), companyQuery);
-
-  return (
-    <View style={styles.screen}>
-      <SegmentedControl options={companyRanges} selected={range} onSelect={setRange} />
-
-      <Section eyebrow="Companies" title={companyRangeTitle(range)}>
-        <RankList rows={rows} emptyLabel="No matching company telemetry available." logoRefreshKey={logoRefreshKey} showStock />
-      </Section>
-    </View>
-  );
-}
-
-function RegionsScreenWrapper({ analytics, error, loading }: { analytics: Analytics; error: string | null; loading: boolean }) {
-  const [regionQuery, setRegionQuery] = useState('');
-  const [refreshing, setRefreshing] = useState(false);
-  const [localAnalytics, setLocalAnalytics] = useState(analytics);
-
-  async function handleRefresh() {
-    setRefreshing(true);
-    // Recalculate analytics - force re-render
-    setLocalAnalytics({ ...analytics });
-    // Simulate a brief refresh action
-    await new Promise(resolve => setTimeout(resolve, 500));
-    setRefreshing(false);
-  }
-
-  // Update local analytics when parent analytics changes
-  useEffect(() => {
-    setLocalAnalytics(analytics);
-  }, [analytics]);
-
-  return (
-    <ScreenShell loading={loading} error={error} onRefresh={handleRefresh} refreshing={refreshing} searchValue={regionQuery} onSearchChange={setRegionQuery} searchPlaceholder="Search states or industries">
-      <RegionsScreen analytics={localAnalytics} regionQuery={regionQuery} />
-    </ScreenShell>
-  );
-}
-
-function RegionsScreen({ analytics, regionQuery }: { analytics: Analytics; regionQuery: string }) {
-  const [range, setRange] = useState<CompanyRangeKey>('30d');
-  const stateRows = filterRankedRows(getRegionRowsForRange(analytics, range), regionQuery);
-  const industryRows = filterRankedRows(getIndustryRowsForRange(analytics, range), regionQuery);
-
-  const stateTitle = range === '7d' ? 'State exposure, last 7 days' : range === '30d' ? 'State exposure, last 30 days' : 'State exposure, all time';
-  const industryTitle = range === '7d' ? 'Industry stress, last 7 days' : range === '30d' ? 'Industry stress, last 30 days' : 'Industry stress, all time';
-
-  return (
-    <View style={styles.screen}>
-      <SegmentedControl options={companyRanges} selected={range} onSelect={setRange} />
-
-      <Section eyebrow="Geography" title={stateTitle}>
-        <BarList rows={stateRows} />
-      </Section>
-
-      <Section eyebrow="Sectors" title={industryTitle}>
-        <BarList rows={industryRows} />
-      </Section>
-    </View>
-  );
-}
-
-function NoticesScreenWrapper({ error, loading, notices }: { error: string | null; loading: boolean; notices: WarnNotice[] }) {
-  const [noticeQuery, setNoticeQuery] = useState('');
-  const [refreshing, setRefreshing] = useState(false);
-  const [logoRefreshKey, setLogoRefreshKey] = useState(0);
-
-  async function handleRefresh() {
-    setRefreshing(true);
-    // Increment logo refresh key to force logo re-fetching
-    setLogoRefreshKey((current) => current + 1);
-    // Simulate a brief refresh action
-    await new Promise(resolve => setTimeout(resolve, 500));
-    setRefreshing(false);
-  }
-
-  return (
-    <ScreenShell loading={loading} error={error} onRefresh={handleRefresh} refreshing={refreshing} searchValue={noticeQuery} onSearchChange={setNoticeQuery} searchPlaceholder="Search notices">
-      <NoticesScreen logoRefreshKey={logoRefreshKey} notices={notices} noticeQuery={noticeQuery} />
-    </ScreenShell>
-  );
-}
-
-function NoticesScreen({ logoRefreshKey, notices, noticeQuery }: { logoRefreshKey: number; notices: WarnNotice[]; noticeQuery: string }) {
-  const [range, setRange] = useState<NoticeRangeKey>('30d');
-  const [expandedNotice, setExpandedNotice] = useState<string | null>(null);
-  const visibleNotices = filterNotices(getNoticesForRange(notices, range), noticeQuery);
-
-  return (
-    <View style={styles.screen}>
-      <SegmentedControl options={noticeRanges} selected={range} onSelect={setRange} />
-
-      <Section eyebrow="Company tape" title={noticeRangeTitle(range)}>
-        {visibleNotices.length ? (
-          visibleNotices.map((notice) => (
-            <NoticeRow
-              key={notice.id}
-              logoRefreshKey={logoRefreshKey}
-              notice={notice}
-              isExpanded={expandedNotice === notice.id}
-              onToggle={() => setExpandedNotice(expandedNotice === notice.id ? null : notice.id)}
-            />
-          ))
-        ) : (
-          <Text style={styles.emptyText}>No matching WARN notices.</Text>
-        )}
-      </Section>
-    </View>
-  );
-}
+// ─── REDDIT SCREEN ──────────────────────────────────────────────────────────
 
 function RedditScreenWrapper() {
   const [loading, setLoading] = useState(true);
@@ -865,13 +726,6 @@ function RedditScreenWrapper() {
     setError(null);
 
     try {
-      // Reddit API has CORS restrictions on web
-      if (Platform.OS === 'web') {
-        setError('Reddit integration is only available on the mobile app for now. Stay tuned for updates on this feature in the future!.');
-        setLoading(false);
-        return;
-      }
-
       // Try to load from cache first
       const cached = await AsyncStorage.getItem(REDDIT_CACHE_KEY);
       if (cached) {
@@ -977,12 +831,6 @@ function RedditScreenWrapper() {
   }
 
   async function handleRefresh() {
-    // Disable refresh on web
-    if (Platform.OS === 'web') {
-      setError('Reddit integration is only available on mobile due to browser CORS restrictions.');
-      return;
-    }
-
     // Check if enough time has passed since last fetch
     const lastFetchStr = await AsyncStorage.getItem(REDDIT_LAST_FETCH_KEY);
     if (lastFetchStr) {
@@ -1003,18 +851,60 @@ function RedditScreenWrapper() {
     setRefreshing(false);
   }
 
+  const tabBarHeight = Platform.OS === 'web' ? 0 : useBottomTabBarHeight();
+
   return (
-    <ScreenShell
-      loading={loading}
-      error={error}
-      onRefresh={handleRefresh}
-      refreshing={refreshing}
-      searchValue={searchQuery}
-      onSearchChange={setSearchQuery}
-      searchPlaceholder="Search Reddit posts"
-    >
-      <RedditScreen posts={posts} searchQuery={searchQuery} />
-    </ScreenShell>
+    <SafeAreaView edges={['top', 'left', 'right']} style={styles.safeArea}>
+      {/* ── Fixed header — never shifts during load/refresh ── */}
+      <View style={styles.redditFixedHeader}>
+        <View style={styles.homeHeaderTop}>
+          <View style={styles.logoMark}>
+            <Text style={styles.logoText}>b{'\n'}WARN{'\n'}ed</Text>
+          </View>
+          <View style={styles.searchInputContainer}>
+            <TextInput
+              autoCapitalize="none"
+              clearButtonMode={Platform.OS === 'ios' ? 'while-editing' : 'never'}
+              onChangeText={setSearchQuery}
+              placeholder="Search Reddit posts…"
+              placeholderTextColor={palette.muted}
+              style={styles.headerSearchInput}
+              value={searchQuery}
+            />
+            {Platform.OS === 'android' && searchQuery.length > 0 && (
+              <Pressable onPress={() => setSearchQuery('')} style={styles.clearButton} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                <Text style={styles.clearButtonText}>✕</Text>
+              </Pressable>
+            )}
+          </View>
+        </View>
+      </View>
+
+      {/* ── Scrollable content — header won't jump when this changes ── */}
+      <ScrollView
+        contentContainerStyle={[styles.content, { paddingBottom: tabBarHeight + 18 }]}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} tintColor={palette.red} colors={[palette.red]} />
+        }
+        showsVerticalScrollIndicator={false}
+      >
+        {loading ? (
+          <View style={styles.loadingPanel}>
+            <ActivityIndicator color={palette.red} size="large" />
+          </View>
+        ) : (
+          <>
+            {error ? (
+              <View style={styles.alert}>
+                <Text style={styles.alertTitle}>Reddit feed issue</Text>
+                <Text style={styles.alertText}>{error}</Text>
+              </View>
+            ) : null}
+            <RedditScreen posts={posts} searchQuery={searchQuery} />
+          </>
+        )}
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
@@ -1921,6 +1811,8 @@ const styles = StyleSheet.create({
     backgroundColor: palette.page,
     flex: 1,
   },
+
+  // ── Navigator ──────────────────────────────────────────────
   navigatorBar: {
     backgroundColor: palette.panel,
     borderTopColor: palette.faint,
@@ -1945,10 +1837,6 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '900',
   },
-  navigatorIcon: {
-    fontSize: 14,
-    fontWeight: '900',
-  },
   tabGlyph: {
     alignItems: 'center',
     borderRadius: 8,
@@ -1959,16 +1847,20 @@ const styles = StyleSheet.create({
   tabGlyphActive: {
     backgroundColor: palette.redSoft,
   },
-  content: {
-    gap: 16,
-    padding: 18,
-    paddingBottom: 14,
+
+  // ── Home screen header ─────────────────────────────────────
+  homeHeader: {
+    backgroundColor: palette.page,
+    borderBottomColor: palette.faint,
+    borderBottomWidth: 1,
+    elevation: 2,
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingBottom: 12,
+    paddingTop: 10,
+    zIndex: 1,
   },
-  header: {
-    gap: 16,
-    paddingTop: 12,
-  },
-  logoRow: {
+  homeHeaderTop: {
     alignItems: 'center',
     flexDirection: 'row',
     gap: 12,
@@ -1977,15 +1869,50 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: palette.ink,
     borderRadius: 8,
-    height: 55,
+    height: 46,
     justifyContent: 'center',
     paddingHorizontal: 8,
     paddingVertical: 4,
-    width: 62,
+    width: 52,
+  },
+  logoText: {
+    color: palette.panel,
+    fontSize: 10,
+    fontWeight: '900',
+    lineHeight: 12,
+    textAlign: 'center',
+  },
+  homeTitleBlock: {
+    flex: 1,
+  },
+  homeAppTitle: {
+    color: palette.ink,
+    fontSize: 20,
+    fontWeight: '900',
+    letterSpacing: -0.5,
+  },
+  homeAppSubtitle: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 1,
   },
   searchInputContainer: {
     flex: 1,
     position: 'relative',
+  },
+  homeSearchInput: {
+    backgroundColor: palette.panel,
+    borderColor: palette.faint,
+    borderRadius: 10,
+    borderWidth: 1,
+    color: palette.ink,
+    fontSize: 15,
+    fontWeight: '600',
+    minHeight: 44,
+    paddingHorizontal: 14,
+    paddingRight: 40,
+    paddingVertical: 10,
   },
   headerSearchInput: {
     backgroundColor: palette.panel,
@@ -2018,9 +1945,8 @@ const styles = StyleSheet.create({
   refreshButton: {
     backgroundColor: palette.red,
     borderRadius: 8,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    minWidth: 120,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -2030,54 +1956,264 @@ const styles = StyleSheet.create({
   },
   refreshButtonText: {
     color: palette.panel,
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: '900',
   },
-  logoText: {
-    color: palette.panel,
-    fontSize: 11,
-    fontWeight: '900',
-    lineHeight: 13,
-    textAlign: 'center',
+
+  // ── Home scrollable content ────────────────────────────────
+  homeContent: {
+    gap: 12,
+    padding: 14,
   },
-  headerCopy: {
-    flex: 1,
+
+  // ── Stats cards ────────────────────────────────────────────
+  statsRow: {
+    gap: 10,
+    paddingRight: 2,
   },
-  title: {
-    color: palette.ink,
-    fontSize: 32,
-    fontWeight: '900',
-    lineHeight: 36,
-    marginTop: 3,
-  },
-  metaRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  metaPill: {
+  statCard: {
     backgroundColor: palette.panel,
+    borderColor: palette.faint,
+    borderRadius: 10,
+    borderWidth: 1,
+    minWidth: 100,
+    padding: 14,
+  },
+  statCardAccentBar: {
+    borderRadius: 3,
+    height: 4,
+    marginBottom: 10,
+    width: 28,
+  },
+  statCardValue: {
+    color: palette.ink,
+    fontSize: 24,
+    fontWeight: '900',
+    letterSpacing: -0.5,
+  },
+  statCardLabel: {
+    color: palette.muted,
+    fontSize: 11,
+    fontWeight: '800',
+    marginTop: 3,
+    textTransform: 'uppercase',
+  },
+
+  // ── Date range ─────────────────────────────────────────────
+  dateRangeRow: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  dateChip: {
+    alignItems: 'center',
     borderColor: palette.faint,
     borderRadius: 8,
     borderWidth: 1,
     flex: 1,
-    paddingHorizontal: 12,
-    paddingVertical: 9,
+    minHeight: 36,
+    justifyContent: 'center',
   },
-  metaLabel: {
+  dateChipActive: {
+    backgroundColor: palette.ink,
+    borderColor: palette.ink,
+  },
+  dateChipText: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  dateChipTextActive: {
+    color: palette.panel,
+  },
+
+  // ── Filter controls ────────────────────────────────────────
+  filterControlRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+  },
+  filterToggleBtn: {
+    alignItems: 'center',
+    borderColor: palette.faint,
+    borderRadius: 8,
+    borderWidth: 1,
+    justifyContent: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  filterToggleBtnActive: {
+    backgroundColor: palette.soft,
+    borderColor: palette.ink,
+  },
+  filterToggleBtnBadged: {
+    backgroundColor: palette.redSoft,
+    borderColor: palette.red,
+  },
+  filterToggleBtnText: {
+    color: palette.muted,
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  filterToggleBtnTextActive: {
+    color: palette.ink,
+  },
+  sortRow: {
+    flex: 1,
+    flexDirection: 'row',
+    gap: 6,
+    justifyContent: 'flex-end',
+  },
+  sortChip: {
+    alignItems: 'center',
+    borderColor: palette.faint,
+    borderRadius: 8,
+    borderWidth: 1,
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  sortChipActive: {
+    backgroundColor: palette.ink,
+    borderColor: palette.ink,
+  },
+  sortChipText: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  sortChipTextActive: {
+    color: palette.panel,
+  },
+
+  // ── Filter panel ───────────────────────────────────────────
+  filterPanel: {
+    backgroundColor: palette.panel,
+    borderColor: palette.faint,
+    borderRadius: 10,
+    borderWidth: 1,
+    gap: 8,
+    padding: 14,
+  },
+  filterGroupLabel: {
     color: palette.muted,
     fontSize: 10,
-    fontWeight: '800',
+    fontWeight: '900',
+    letterSpacing: 0.5,
+    marginTop: 4,
     textTransform: 'uppercase',
   },
-  metaValue: {
+  filterChipsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    paddingBottom: 2,
+  },
+  filterChip: {
+    alignItems: 'center',
+    borderColor: palette.faint,
+    borderRadius: 6,
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  filterChipActive: {
+    backgroundColor: palette.ink,
+    borderColor: palette.ink,
+  },
+  filterChipText: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  filterChipTextActive: {
+    color: palette.panel,
+  },
+  clearFiltersBtn: {
+    alignItems: 'center',
+    borderColor: palette.red,
+    borderRadius: 8,
+    borderWidth: 1,
+    marginTop: 4,
+    paddingVertical: 10,
+  },
+  clearFiltersBtnText: {
+    color: palette.red,
+    fontSize: 13,
+    fontWeight: '900',
+  },
+
+  // ── Active filter pills ────────────────────────────────────
+  activeFiltersRow: {
+    gap: 6,
+    paddingBottom: 2,
+  },
+  activeFilterPill: {
+    backgroundColor: palette.redSoft,
+    borderColor: '#ffd1c5',
+    borderRadius: 6,
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  activeFilterPillText: {
+    color: palette.red,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  clearAllPill: {
+    backgroundColor: palette.soft,
+    borderColor: palette.faint,
+    borderRadius: 6,
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  clearAllPillText: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
+  // ── Results summary ────────────────────────────────────────
+  resultsSummaryBar: {
+    alignItems: 'center',
+    borderBottomColor: palette.faint,
+    borderBottomWidth: 1,
+    borderTopColor: palette.faint,
+    borderTopWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 2,
+    paddingVertical: 8,
+  },
+  resultsSummaryCount: {
     color: palette.ink,
     fontSize: 13,
-    fontWeight: '800',
-    marginTop: 3,
+    fontWeight: '900',
   },
-  screen: {
+  resultsSummaryMeta: {
+    color: palette.muted,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+
+  // ── Reddit fixed header ────────────────────────────────────
+  redditFixedHeader: {
+    backgroundColor: palette.page,
+    borderBottomColor: palette.faint,
+    borderBottomWidth: 1,
+    elevation: 2,
+    paddingHorizontal: 16,
+    paddingBottom: 12,
+    paddingTop: 10,
+    zIndex: 1,
+  },
+
+  // ── Shared content layout ──────────────────────────────────
+  content: {
     gap: 16,
+    padding: 16,
+    paddingBottom: 14,
   },
   loadingPanel: {
     alignItems: 'center',
@@ -2103,48 +2239,12 @@ const styles = StyleSheet.create({
     lineHeight: 19,
     marginTop: 4,
   },
-  metricGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 10,
-  },
-  metricCard: {
-    backgroundColor: palette.panel,
-    borderColor: palette.faint,
-    borderRadius: 8,
-    borderWidth: 1,
-    minHeight: 116,
-    padding: 14,
-    width: '48%',
-  },
-  metricAccent: {
-    borderRadius: 2,
-    height: 4,
-    marginBottom: 14,
-    width: 36,
-  },
-  metricLabel: {
-    color: palette.muted,
-    fontSize: 11,
-    fontWeight: '800',
-    textTransform: 'uppercase',
-  },
-  metricValue: {
-    color: palette.ink,
-    fontSize: 30,
-    fontWeight: '900',
-    marginTop: 6,
-  },
-  metricDetail: {
-    color: palette.muted,
-    fontSize: 12,
-    fontWeight: '700',
-    marginTop: 5,
-  },
+
+  // ── Section (used by Reddit) ───────────────────────────────
   section: {
     backgroundColor: palette.panel,
     borderColor: palette.faint,
-    borderRadius: 8,
+    borderRadius: 10,
     borderWidth: 1,
     padding: 16,
   },
@@ -2163,18 +2263,8 @@ const styles = StyleSheet.create({
   sectionBody: {
     marginTop: 14,
   },
-  searchInput: {
-    backgroundColor: palette.panel,
-    borderColor: palette.faint,
-    borderRadius: 8,
-    borderWidth: 1,
-    color: palette.ink,
-    fontSize: 15,
-    fontWeight: '800',
-    minHeight: 44,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-  },
+
+  // ── Segmented control ──────────────────────────────────────
   segmentRow: {
     backgroundColor: palette.soft,
     borderColor: palette.faint,
@@ -2202,217 +2292,8 @@ const styles = StyleSheet.create({
   segmentTextActive: {
     color: palette.ink,
   },
-  rankList: {
-    gap: 0,
-  },
-  companyRow: {
-    alignItems: 'center',
-    borderBottomColor: palette.faint,
-    borderBottomWidth: 1,
-    flexDirection: 'row',
-    gap: 12,
-    paddingVertical: 12,
-  },
-  companyRowExpanded: {
-    backgroundColor: palette.soft,
-    borderBottomWidth: 0,
-    borderRadius: 8,
-    marginHorizontal: -8,
-    paddingHorizontal: 20,
-  },
-  expandIndicator: {
-    color: palette.muted,
-    fontSize: 12,
-    fontWeight: '700',
-    marginLeft: 4,
-  },
-  companyDetails: {
-    backgroundColor: palette.panel,
-    borderBottomColor: palette.faint,
-    borderBottomWidth: 1,
-    gap: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-  },
-  detailRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: 12,
-  },
-  detailLabel: {
-    color: palette.muted,
-    fontSize: 13,
-    fontWeight: '700',
-    flex: 1,
-  },
-  detailValue: {
-    color: palette.ink,
-    fontSize: 13,
-    fontWeight: '900',
-    flex: 2,
-    textAlign: 'right',
-  },
-  logoStack: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    gap: 7,
-  },
-  companyLogo: {
-    alignItems: 'center',
-    backgroundColor: palette.soft,
-    borderColor: palette.faint,
-    borderRadius: 8,
-    borderWidth: 1,
-    height: 36,
-    justifyContent: 'center',
-    overflow: 'hidden',
-    width: 36,
-  },
-  companyLogoImage: {
-    height: 36,
-    width: 36,
-  },
-  companyLogoText: {
-    color: palette.ink,
-    fontSize: 12,
-    fontWeight: '900',
-  },
-  rankBadge: {
-    alignItems: 'center',
-    backgroundColor: palette.soft,
-    borderRadius: 8,
-    height: 32,
-    justifyContent: 'center',
-    width: 32,
-  },
-  rankBadgeText: {
-    color: palette.ink,
-    fontSize: 13,
-    fontWeight: '900',
-  },
-  companyMain: {
-    flex: 1,
-  },
-  companyName: {
-    color: palette.ink,
-    fontSize: 15,
-    fontWeight: '900',
-  },
-  companyMeta: {
-    color: palette.muted,
-    fontSize: 12,
-    marginTop: 4,
-  },
-  companyImpact: {
-    alignItems: 'flex-end',
-  },
-  companyWorkers: {
-    color: palette.red,
-    fontSize: 16,
-    fontWeight: '900',
-  },
-  companyWorkersLabel: {
-    color: palette.muted,
-    fontSize: 11,
-    fontWeight: '700',
-    marginTop: 2,
-  },
-  stockText: {
-    color: palette.muted,
-    fontSize: 11,
-    fontWeight: '900',
-    marginTop: 4,
-    maxWidth: 90,
-  },
-  stockUp: {
-    color: palette.green,
-  },
-  stockDown: {
-    color: palette.red,
-  },
-  emptyText: {
-    color: palette.muted,
-    fontSize: 14,
-    lineHeight: 20,
-  },
-  barList: {
-    gap: 14,
-  },
-  barRow: {
-    gap: 8,
-  },
-  barLabelRow: {
-    flexDirection: 'row',
-    gap: 12,
-    justifyContent: 'space-between',
-  },
-  barLabel: {
-    color: palette.ink,
-    flex: 1,
-    fontSize: 14,
-    fontWeight: '900',
-  },
-  barValue: {
-    color: palette.muted,
-    fontSize: 13,
-    fontWeight: '800',
-  },
-  barTrack: {
-    backgroundColor: palette.soft,
-    borderRadius: 8,
-    height: 8,
-    overflow: 'hidden',
-  },
-  barFill: {
-    borderRadius: 8,
-    height: 8,
-  },
-  horizontalBarList: {
-    gap: 12,
-    paddingRight: 16,
-  },
-  horizontalBarCard: {
-    backgroundColor: palette.soft,
-    borderColor: palette.faint,
-    borderRadius: 8,
-    borderWidth: 1,
-    minHeight: 160,
-    padding: 12,
-    width: 120,
-  },
-  horizontalBarLabel: {
-    color: palette.ink,
-    fontSize: 13,
-    fontWeight: '900',
-    height: 36,
-    lineHeight: 17,
-  },
-  horizontalBarValue: {
-    color: palette.red,
-    fontSize: 18,
-    fontWeight: '900',
-    marginTop: 4,
-  },
-  horizontalBarSubtext: {
-    color: palette.muted,
-    fontSize: 10,
-    fontWeight: '700',
-    marginTop: 2,
-  },
-  horizontalBarTrack: {
-    alignItems: 'center',
-    backgroundColor: palette.panel,
-    borderRadius: 6,
-    flex: 1,
-    justifyContent: 'flex-end',
-    marginTop: 12,
-    overflow: 'hidden',
-    width: '100%',
-  },
-  horizontalBarFill: {
-    borderRadius: 6,
-    width: '100%',
-  },
+
+  // ── Notice row ─────────────────────────────────────────────
   noticeRow: {
     alignItems: 'center',
     borderBottomColor: palette.faint,
@@ -2474,42 +2355,64 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginTop: 2,
   },
-  horizontalSectionsContainer: {
-    gap: 12,
-    paddingRight: 18,
-  },
-  horizontalSectionsContainerWeb: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  horizontalSectionWeb: {
-    flex: 1,
-    width: undefined,
-    alignSelf: 'stretch',
-  },
-  horizontalSection: {
-    backgroundColor: palette.panel,
+
+  // ── Company logo ───────────────────────────────────────────
+  companyLogo: {
+    alignItems: 'center',
+    backgroundColor: palette.soft,
     borderColor: palette.faint,
     borderRadius: 8,
     borderWidth: 1,
-    padding: 16,
-    width: 340,
+    height: 36,
+    justifyContent: 'center',
+    overflow: 'hidden',
+    width: 36,
   },
-  horizontalSectionEyebrow: {
-    color: palette.red,
-    fontSize: 11,
-    fontWeight: '900',
-    textTransform: 'uppercase',
+  companyLogoImage: {
+    height: 36,
+    width: 36,
   },
-  horizontalSectionTitle: {
+  companyLogoText: {
     color: palette.ink,
-    fontSize: 20,
+    fontSize: 12,
     fontWeight: '900',
-    marginTop: 3,
   },
-  horizontalSectionBody: {
-    marginTop: 14,
+
+  // ── Detail rows (inside expanded notices) ─────────────────
+  companyDetails: {
+    backgroundColor: palette.panel,
+    borderBottomColor: palette.faint,
+    borderBottomWidth: 1,
+    gap: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
   },
+  detailRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  detailLabel: {
+    color: palette.muted,
+    fontSize: 13,
+    fontWeight: '700',
+    flex: 1,
+  },
+  detailValue: {
+    color: palette.ink,
+    fontSize: 13,
+    fontWeight: '900',
+    flex: 2,
+    textAlign: 'right',
+  },
+  expandIndicator: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '700',
+    marginLeft: 4,
+  },
+
+  // ── Reddit posts ───────────────────────────────────────────
   redditPostRow: {
     borderBottomColor: palette.faint,
     borderBottomWidth: 1,
@@ -2554,20 +2457,6 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     lineHeight: 22,
   },
-  companyTag: {
-    alignSelf: 'flex-start',
-    backgroundColor: palette.redSoft,
-    borderColor: '#ffd1c5',
-    borderRadius: 4,
-    borderWidth: 1,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-  },
-  companyTagText: {
-    color: palette.red,
-    fontSize: 11,
-    fontWeight: '900',
-  },
   redditStats: {
     flexDirection: 'row',
     gap: 16,
@@ -2611,5 +2500,245 @@ const styles = StyleSheet.create({
     color: palette.panel,
     fontSize: 14,
     fontWeight: '900',
+  },
+
+  // ── Section ──────────────────────────────────────────────
+  screen: {
+    gap: 16,
+  },
+
+  // ── MetaPill ──────────────────────────────────────────────
+  metaRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  metaPill: {
+    backgroundColor: palette.panel,
+    borderColor: palette.faint,
+    borderRadius: 8,
+    borderWidth: 1,
+    flex: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+  },
+  metaLabel: {
+    color: palette.muted,
+    fontSize: 10,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+  },
+  metaValue: {
+    color: palette.ink,
+    fontSize: 13,
+    fontWeight: '800',
+    marginTop: 3,
+  },
+
+  // ── MetricCard ─────────────────────────────────────────────
+  metricGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  metricCard: {
+    backgroundColor: palette.panel,
+    borderColor: palette.faint,
+    borderRadius: 8,
+    borderWidth: 1,
+    minHeight: 116,
+    padding: 14,
+    width: '48%',
+  },
+  metricAccent: {
+    borderRadius: 2,
+    height: 4,
+    marginBottom: 14,
+    width: 36,
+  },
+  metricLabel: {
+    color: palette.muted,
+    fontSize: 11,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+  },
+  metricValue: {
+    color: palette.ink,
+    fontSize: 30,
+    fontWeight: '900',
+    marginTop: 6,
+  },
+  metricDetail: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 5,
+  },
+
+  // ── RankList / CompanyRow ──────────────────────────────────
+  rankList: {
+    gap: 0,
+  },
+  companyRow: {
+    alignItems: 'center',
+    borderBottomColor: palette.faint,
+    borderBottomWidth: 1,
+    flexDirection: 'row',
+    gap: 12,
+    paddingVertical: 12,
+  },
+  companyRowExpanded: {
+    backgroundColor: palette.soft,
+    borderBottomWidth: 0,
+    borderRadius: 8,
+    marginHorizontal: -8,
+    paddingHorizontal: 20,
+  },
+  logoStack: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 7,
+  },
+  rankBadge: {
+    alignItems: 'center',
+    backgroundColor: palette.soft,
+    borderRadius: 8,
+    height: 32,
+    justifyContent: 'center',
+    width: 32,
+  },
+  rankBadgeText: {
+    color: palette.ink,
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  companyMain: {
+    flex: 1,
+  },
+  companyName: {
+    color: palette.ink,
+    fontSize: 15,
+    fontWeight: '900',
+  },
+  companyMeta: {
+    color: palette.muted,
+    fontSize: 12,
+    marginTop: 4,
+  },
+  companyImpact: {
+    alignItems: 'flex-end',
+  },
+  companyWorkers: {
+    color: palette.red,
+    fontSize: 16,
+    fontWeight: '900',
+  },
+  companyWorkersLabel: {
+    color: palette.muted,
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  stockText: {
+    color: palette.muted,
+    fontSize: 11,
+    fontWeight: '900',
+    marginTop: 4,
+    maxWidth: 90,
+  },
+  stockUp: {
+    color: palette.green,
+  },
+  stockDown: {
+    color: palette.red,
+  },
+
+  // ── BarList ───────────────────────────────────────────────
+  barList: {
+    gap: 14,
+  },
+  barRow: {
+    gap: 8,
+  },
+  barLabelRow: {
+    flexDirection: 'row',
+    gap: 12,
+    justifyContent: 'space-between',
+  },
+  barLabel: {
+    color: palette.ink,
+    flex: 1,
+    fontSize: 14,
+    fontWeight: '900',
+  },
+  barValue: {
+    color: palette.muted,
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  barTrack: {
+    backgroundColor: palette.soft,
+    borderRadius: 8,
+    height: 8,
+    overflow: 'hidden',
+  },
+  barFill: {
+    borderRadius: 8,
+    height: 8,
+  },
+
+  // ── HorizontalBarList ─────────────────────────────────────
+  horizontalBarList: {
+    gap: 12,
+    paddingRight: 16,
+  },
+  horizontalBarCard: {
+    backgroundColor: palette.soft,
+    borderColor: palette.faint,
+    borderRadius: 8,
+    borderWidth: 1,
+    minHeight: 160,
+    padding: 12,
+    width: 120,
+  },
+  horizontalBarLabel: {
+    color: palette.ink,
+    fontSize: 13,
+    fontWeight: '900',
+    height: 36,
+    lineHeight: 17,
+  },
+  horizontalBarValue: {
+    color: palette.red,
+    fontSize: 18,
+    fontWeight: '900',
+    marginTop: 4,
+  },
+  horizontalBarSubtext: {
+    color: palette.muted,
+    fontSize: 10,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  horizontalBarTrack: {
+    alignItems: 'center',
+    backgroundColor: palette.panel,
+    borderRadius: 6,
+    flex: 1,
+    justifyContent: 'flex-end',
+    marginTop: 12,
+    overflow: 'hidden',
+    width: '100%',
+  },
+  horizontalBarFill: {
+    borderRadius: 6,
+    width: '100%',
+  },
+
+  // ── Misc ───────────────────────────────────────────────────
+  emptyText: {
+    color: palette.muted,
+    fontSize: 14,
+    lineHeight: 20,
   },
 });
